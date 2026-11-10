@@ -21,14 +21,22 @@ CONFIG_DIR = os.path.expanduser("~/.config/kde-lockscreen-config")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 LOCKSCREEN_OVERRIDE_DIR = os.path.expanduser("~/.local/share/plasma/shells/org.kde.plasma.desktop")
 LOCKSCREEN_QML = os.path.join(LOCKSCREEN_OVERRIDE_DIR, "contents/lockscreen/LockScreenUi.qml")
-LOGOUT_QML = os.path.join(LOCKSCREEN_OVERRIDE_DIR, "contents/logout/Logout.qml")
+
+# Real KDE Plasma Look-and-Feel for Logout (/usr/share/plasma/look-and-feel/org.kde.breeze.desktop)
+SYSTEM_LOGOUT_DIR = "/usr/share/plasma/look-and-feel/org.kde.breeze.desktop"
+SYSTEM_LOGOUT_QML = os.path.join(SYSTEM_LOGOUT_DIR, "contents/logout/Logout.qml")
+USER_LOGOUT_DIR = os.path.expanduser("~/.local/share/plasma/look-and-feel/org.kde.breeze.desktop")
+LOGOUT_QML = os.path.join(USER_LOGOUT_DIR, "contents/logout/Logout.qml")
 
 # Real System SDDM Breeze Theme (/usr/share/sddm/themes/breeze)
 SYSTEM_SDDM_DIR = "/usr/share/sddm/themes/breeze"
 SYSTEM_SDDM_QML = os.path.join(SYSTEM_SDDM_DIR, "Main.qml")
+SYSTEM_SDDM_BG_QML = os.path.join(SYSTEM_SDDM_DIR, "Background.qml")
 SYSTEM_SDDM_STOCK_BACKUP = os.path.join(CONFIG_DIR, "breeze-stock/Main.qml")
+SYSTEM_SDDM_BG_STOCK_BACKUP = os.path.join(CONFIG_DIR, "breeze-stock/Background.qml")
 SYSTEM_SDDM_THEME_CONF = os.path.join(SYSTEM_SDDM_DIR, "theme.conf")
 SYSTEM_SDDM_THEME_CONF_USER = os.path.join(SYSTEM_SDDM_DIR, "theme.conf.user")
+SYSTEM_SDDM_THEME_CONF_STOCK = os.path.join(CONFIG_DIR, "breeze-stock/theme.conf")
 
 # Local User Theme Directory for SDDM testing
 SDDM_THEME_DIR = os.path.expanduser("~/.local/share/sddm-themes/breeze-top-clock")
@@ -82,7 +90,7 @@ DEFAULT_CONFIG = {
     # SDDM Breeze Login Screen Customization
     "customizeSddmScreen": True,
     "sddmBackground": "",
-    "sddmBackgroundColor": "#2777ff",
+    "sddmBackgroundColor": "#0f172a",
     "sddmShowLogo": "hidden",
 
     # Logout Screen Customization
@@ -92,8 +100,9 @@ DEFAULT_CONFIG = {
     "logoutCustomTitle": "",
     "logoutTitleColor": "#f8fafc",
     "logoutTitlePointSize": 18,
-    "logoutBgOpacity": 75,
-    "logoutBgColor": "#0f172a",
+    "logoutWallpaper": "",
+    "logoutBgOpacity": 35,
+    "logoutBgColor": "#000000",
     "logoutShowCountdown": True,
 }
 
@@ -173,8 +182,12 @@ def write_system_file(dest_path, content, stock_backup_path=None, parent_widget=
     temp_dir = os.path.expanduser("~/.cache/kde-lockscreen-config")
     os.makedirs(temp_dir, exist_ok=True)
     temp_file = os.path.join(temp_dir, os.path.basename(dest_path) + ".tmp")
-    with open(temp_file, "w") as f:
-        f.write(content)
+    if isinstance(content, bytes):
+        with open(temp_file, "wb") as f:
+            f.write(content)
+    else:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(content)
 
     # 1. Try direct write if we already have permissions
     try:
@@ -293,6 +306,119 @@ def restore_system_stock_file(dest_path, stock_backup_path=None, user_fallback_b
         raise PermissionError(f"Could not restore {dest_path} (pkexec failed)")
 
 
+def get_current_lockscreen_wallpaper():
+    """Reads wallpaper image path from ~/.config/kscreenlockerrc if present."""
+    k_rc = os.path.expanduser("~/.config/kscreenlockerrc")
+    if os.path.exists(k_rc):
+        try:
+            with open(k_rc, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("Image="):
+                        val = line.split("=", 1)[1].strip()
+                        if os.path.isfile(val):
+                            return val
+        except Exception:
+            pass
+    return ""
+
+
+def copy_image_to_system_sddm(image_path, parent_widget=None):
+    """
+    Copies any local user image (jpg, png, webp, svg, bmp) directly to
+    /usr/share/sddm/themes/breeze/custom_wallpaper.<ext> with 0644 permissions.
+    Preserves 100% uncompressed raw file bytes so SDDM greeter can read it losslessly.
+    Returns the installed system file path.
+    """
+    if not image_path or not os.path.isfile(image_path):
+        return ""
+    ext = os.path.splitext(image_path)[1].lower()
+    if not ext:
+        ext = ".png"
+    target_system_path = os.path.join(SYSTEM_SDDM_DIR, f"custom_wallpaper{ext}")
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+    write_system_file(target_system_path, img_bytes, stock_backup_path=None, parent_widget=parent_widget)
+    return target_system_path
+
+
+def patch_system_sddm_background_qml(parent_widget=None):
+    """
+    Ensures /usr/share/sddm/themes/breeze/Background.qml has an uncompressed Image loader:
+    - fillMode: Image.PreserveAspectCrop
+    - smooth: true, mipmap: true
+    - NO sourceSize (zero downsampling/compression artifacts)
+    - Fallback background color #0f172a (never flashes white)
+    """
+    if not os.path.exists(SYSTEM_SDDM_BG_QML):
+        return
+    if not os.path.exists(SYSTEM_SDDM_BG_STOCK_BACKUP):
+        os.makedirs(os.path.dirname(SYSTEM_SDDM_BG_STOCK_BACKUP), exist_ok=True)
+        try:
+            shutil.copy2(SYSTEM_SDDM_BG_QML, SYSTEM_SDDM_BG_STOCK_BACKUP)
+        except Exception:
+            pass
+
+    bg_qml_content = """/*
+    SPDX-FileCopyrightText: 2016 Boudhayan Gupta <bgupta@kde.org>
+    SPDX-License-Identifier: LGPL-2.0-or-later
+*/
+
+import QtQuick
+
+FocusScope {
+    id: sceneBackground
+
+    property var sceneBackgroundType
+    property alias sceneBackgroundColor: sceneColorBackground.color
+    property alias sceneBackgroundImage: sceneImageBackground.source
+
+    Rectangle {
+        id: sceneColorBackground
+        anchors.fill: parent
+        color: "#0f172a"
+    }
+
+    Image {
+        id: sceneImageBackground
+        anchors.fill: parent
+        fillMode: Image.PreserveAspectCrop
+        smooth: true
+        mipmap: true
+        asynchronous: false
+        cache: true
+    }
+
+    states: [
+        State {
+            name: "imageBackground"
+            when: sceneBackgroundType === "image"
+            PropertyChanges {
+                target: sceneColorBackground
+                visible: true
+            }
+            PropertyChanges {
+                target: sceneImageBackground
+                visible: true
+            }
+        },
+        State {
+            name: "colorBackground"
+            when: sceneBackgroundType !== "image"
+            PropertyChanges {
+                target: sceneColorBackground
+                visible: true
+            }
+            PropertyChanges {
+                target: sceneImageBackground
+                visible: false
+            }
+        }
+    ]
+}
+"""
+    write_system_file(SYSTEM_SDDM_BG_QML, bg_qml_content, stock_backup_path=SYSTEM_SDDM_BG_QML + ".stock", parent_widget=parent_widget)
+
+
 def build_lockscreen(src_path, dst_path, is_sddm=False):
     with open(src_path, "r") as f:
         content = f.read()
@@ -340,6 +466,10 @@ def build_lockscreen(src_path, dst_path, is_sddm=False):
 
         // Animations
         property bool enableWindowsGlideAnimation: true
+
+        // Wallpaper & Fallback Tint
+        property string customWallpaper: ""
+        property string wallpaperColor: "#0f172a"
     }
 """
     root_item_header = "Item {\n    id: lockScreenUi" if not is_sddm else "Item {\n    id: root"
@@ -590,6 +720,20 @@ def build_lockscreen(src_path, dst_path, is_sddm=False):
 
     content = re.sub(clock_to_replace, new_clock_block, content, count=1, flags=re.DOTALL)
 
+    if is_sddm:
+        old_bg_block = r"Background\s*\{\s*x:\s*geometry\.x.*?sceneBackgroundImage:\s*config\.background\s*\}"
+        new_bg_block = """Background {
+                x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
+                sceneBackgroundType: "image"
+                sceneBackgroundColor: (customConfig && customConfig.wallpaperColor !== "") ? customConfig.wallpaperColor : (config.color ? config.color : "#0f172a")
+                sceneBackgroundImage: {
+                    var p = (customConfig && customConfig.customWallpaper && customConfig.customWallpaper !== "") ? customConfig.customWallpaper : (config.background ? config.background : "");
+                    if (!p || p === "") return "";
+                    return (p.indexOf(":") === -1) ? ("file://" + p) : p;
+                }
+            }"""
+        content = re.sub(old_bg_block, new_bg_block, content, count=1, flags=re.DOTALL)
+
     prefix = "QQC2." if is_sddm else ""
     old_main_stack = r"(?:QQC2\.)?StackView\s*\{\s*id:\s*mainStack\s*anchors\s*\{[^}]+\}\s*height:"
     new_main_stack = f"""{prefix}StackView {{
@@ -618,10 +762,10 @@ def build_lockscreen(src_path, dst_path, is_sddm=False):
 
 
 def build_logout_screen(src_path, dst_path):
-    """Patches KDE Plasma's Logout.qml to support top clock, custom banner, and background styling."""
+    """Patches KDE Plasma's Logout.qml to support top clock, custom banner, and uncompressed background wallpaper."""
     if not os.path.exists(src_path):
         return
-    with open(src_path, "r") as f:
+    with open(src_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     if "import org.kde.plasma.clock as PlasmaClock" not in content:
@@ -649,18 +793,46 @@ def build_logout_screen(src_path, dst_path):
         property string customTitle: ""
         property string titleColor: "#f8fafc"
         property int titlePointSize: 18
-        property double bgOpacity: 0.75
-        property string bgColor: "#0f172a"
+        property string wallpaperPath: ""
+        property double bgOpacity: 0.35
+        property string bgColor: "#000000"
         property bool showCountdown: true
     }
 
-    Rectangle {
-        id: customLogoutBgOverlay
+    Item {
+        id: customLogoutBgContainer
         anchors.fill: parent
-        z: -1
+        z: -2
         visible: logoutCustomConfig.enabled
-        color: logoutCustomConfig.bgColor
-        opacity: logoutCustomConfig.bgOpacity
+
+        Rectangle {
+            id: customLogoutFallbackBg
+            anchors.fill: parent
+            color: logoutCustomConfig.bgColor !== "" ? logoutCustomConfig.bgColor : "#0f172a"
+        }
+
+        Image {
+            id: customLogoutWallpaper
+            anchors.fill: parent
+            visible: logoutCustomConfig.wallpaperPath !== ""
+            source: {
+                var wp = logoutCustomConfig.wallpaperPath;
+                if (!wp || wp === "") return "";
+                return (wp.indexOf(":") === -1) ? ("file://" + wp) : wp;
+            }
+            fillMode: Image.PreserveAspectCrop
+            smooth: true
+            mipmap: true
+            asynchronous: false
+            cache: true
+        }
+
+        Rectangle {
+            id: customLogoutDimOverlay
+            anchors.fill: parent
+            color: logoutCustomConfig.bgColor !== "" ? logoutCustomConfig.bgColor : "#000000"
+            opacity: logoutCustomConfig.bgOpacity
+        }
     }
 
     ColumnLayout {
@@ -691,6 +863,9 @@ def build_logout_screen(src_path, dst_path):
             font.family: logoutCustomConfig.timeFontFamily !== "" ? logoutCustomConfig.timeFontFamily : Kirigami.Theme.defaultFont.family
             color: logoutCustomConfig.timeColor
             Layout.alignment: logoutCustomConfig.clockAlignment === "Left" ? Qt.AlignLeft : (logoutCustomConfig.clockAlignment === "Right" ? Qt.AlignRight : Qt.AlignHCenter)
+
+            style: Text.Raised
+            styleColor: Qt.rgba(0, 0, 0, 0.75)
         }
 
         Text {
@@ -704,6 +879,9 @@ def build_logout_screen(src_path, dst_path):
             font.family: logoutCustomConfig.dateFontFamily !== "" ? logoutCustomConfig.dateFontFamily : Kirigami.Theme.defaultFont.family
             color: logoutCustomConfig.dateColor
             Layout.alignment: logoutCustomConfig.clockAlignment === "Left" ? Qt.AlignLeft : (logoutCustomConfig.clockAlignment === "Right" ? Qt.AlignRight : Qt.AlignHCenter)
+
+            style: Text.Raised
+            styleColor: Qt.rgba(0, 0, 0, 0.7)
         }
 
         Text {
@@ -715,17 +893,35 @@ def build_logout_screen(src_path, dst_path):
             color: logoutCustomConfig.titleColor
             Layout.topMargin: 6
             Layout.alignment: logoutCustomConfig.clockAlignment === "Left" ? Qt.AlignLeft : (logoutCustomConfig.clockAlignment === "Right" ? Qt.AlignRight : Qt.AlignHCenter)
+
+            style: Text.Raised
+            styleColor: Qt.rgba(0, 0, 0, 0.6)
         }
     }
 """
-    # Insert right after the root Item / FocusScope opening block
     match = re.search(r"(?:Item|FocusScope)\s*\{\s*id:\s*\w+", content)
     if match:
         insert_pos = match.end()
         content = content[:insert_pos] + "\n" + logout_overlay + content[insert_pos:]
 
+    # Hide stock black backgroundRect when custom wallpaper is used
+    rect_replacement = """Rectangle {
+        id: backgroundRect
+        anchors.fill: parent
+        color: "black"
+        opacity: (logoutCustomConfig.enabled && logoutCustomConfig.wallpaperPath !== "") ? 0.0 : 0.85
+        visible: !logoutCustomConfig.enabled || logoutCustomConfig.wallpaperPath === ""
+    }"""
+    content = re.sub(
+        r"Rectangle\s*\{\s*id:\s*backgroundRect.*?(?=\n\s*MouseArea)",
+        rect_replacement,
+        content,
+        count=1,
+        flags=re.DOTALL
+    )
+
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    with open(dst_path, "w") as f:
+    with open(dst_path, "w", encoding="utf-8") as f:
         f.write(content)
 
 
@@ -1173,6 +1369,40 @@ class LockscreenConfigApp(QMainWindow):
         )
         if file_path:
             self.txt_sddm_bg.setText(file_path)
+
+    def clear_sddm_bg_file(self):
+        self.txt_sddm_bg.setText("")
+
+    def match_lockscreen_sddm_bg(self):
+        wall = get_current_lockscreen_wallpaper()
+        if wall:
+            self.txt_sddm_bg.setText(wall)
+        else:
+            QMessageBox.information(self, "Lock Screen Wallpaper", "No custom wallpaper found in ~/.config/kscreenlockerrc.")
+
+    def choose_logout_wallpaper_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Logout Background Image", "", "Images (*.png *.jpg *.jpeg *.svg *.bmp *.webp);;All Files (*)"
+        )
+        if file_path:
+            self.txt_logout_wallpaper.setText(file_path)
+
+    def clear_logout_wallpaper_file(self):
+        self.txt_logout_wallpaper.setText("")
+
+    def match_login_logout_wallpaper(self):
+        login_bg = self.txt_sddm_bg.text().strip() if hasattr(self, "txt_sddm_bg") else ""
+        if login_bg:
+            self.txt_logout_wallpaper.setText(login_bg)
+        else:
+            QMessageBox.information(self, "Login Wallpaper", "Please select a login screen wallpaper first.")
+
+    def match_lockscreen_logout_wallpaper(self):
+        wall = get_current_lockscreen_wallpaper()
+        if wall:
+            self.txt_logout_wallpaper.setText(wall)
+        else:
+            QMessageBox.information(self, "Lock Screen Wallpaper", "No custom wallpaper found in ~/.config/kscreenlockerrc.")
 
     def choose_sddm_bg_color(self):
         self.pick_color_dialog(self.txt_sddm_bg_color.text().strip(), self.set_sddm_bg_color)
@@ -1959,7 +2189,7 @@ class LockscreenConfigApp(QMainWindow):
 
         self.txt_sddm_bg = QLineEdit()
         self.txt_sddm_bg.setMinimumHeight(34)
-        self.txt_sddm_bg.setPlaceholderText("Path to image (Leave empty to keep system default)")
+        self.txt_sddm_bg.setPlaceholderText("Path to any JPG, PNG, WEBP image (raw uncompressed)")
         h_bg.addWidget(self.txt_sddm_bg, 1)
 
         btn_browse = QPushButton("📁 Browse...")
@@ -1967,6 +2197,18 @@ class LockscreenConfigApp(QMainWindow):
         btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_browse.clicked.connect(self.choose_sddm_bg_file)
         h_bg.addWidget(btn_browse)
+
+        btn_clear = QPushButton("❌ Clear")
+        btn_clear.setMinimumHeight(34)
+        btn_clear.setToolTip("Restore system stock Breeze wallpaper")
+        btn_clear.clicked.connect(self.clear_sddm_bg_file)
+        h_bg.addWidget(btn_clear)
+
+        btn_match_lock = QPushButton("🖼️ Match Lock Screen")
+        btn_match_lock.setMinimumHeight(34)
+        btn_match_lock.setToolTip("Use the wallpaper currently set in KDE Lock Screen")
+        btn_match_lock.clicked.connect(self.match_lockscreen_sddm_bg)
+        h_bg.addWidget(btn_match_lock)
         l_look.addLayout(h_bg)
 
         # Background Tint Color
@@ -2028,7 +2270,7 @@ class LockscreenConfigApp(QMainWindow):
 
         lbl_intro = QLabel(
             "Customize the <b>KDE Logout / Shutdown / Reboot Screen</b> (<code>Logout.qml</code>) "
-            "so it matches your Lock and Login screens:"
+            "with top clock, banner, and uncompressed wallpaper:"
         )
         lbl_intro.setWordWrap(True)
         layout.addWidget(lbl_intro)
@@ -2100,24 +2342,57 @@ class LockscreenConfigApp(QMainWindow):
 
         layout.addWidget(grp_clock)
 
-        grp_bg = QGroupBox("Logout Screen Background & Behavior")
+        # Logout Screen Wallpaper & Appearance
+        grp_bg = QGroupBox("Logout Screen Wallpaper & Background")
         l_bg = QVBoxLayout(grp_bg)
         l_bg.setSpacing(12)
 
-        self.btn_logout_bg_color = QPushButton()
-        self.txt_logout_bg_color = QLineEdit("#0f172a")
-        self.txt_logout_bg_color.textChanged.connect(self.on_logout_bg_color_changed)
-        l_bg.addLayout(self.build_color_picker_row(
-            "Backdrop Tint Color:",
-            self.txt_logout_bg_color,
-            self.btn_logout_bg_color,
-            self.choose_logout_bg_color,
-            self.set_logout_bg_color
-        ))
+        # Wallpaper Picker Row
+        h_lwall = QHBoxLayout()
+        h_lwall.setSpacing(10)
+        lbl_lw = QLabel("Background Wallpaper:")
+        lbl_lw.setMinimumWidth(160)
+        h_lwall.addWidget(lbl_lw)
+        self.txt_logout_wallpaper = QLineEdit()
+        self.txt_logout_wallpaper.setMinimumHeight(34)
+        self.txt_logout_wallpaper.setPlaceholderText("Path to any JPG, PNG, WEBP image (Leave empty to use dark backdrop)")
+        h_lwall.addWidget(self.txt_logout_wallpaper, 1)
 
+        btn_browse_lw = QPushButton("📁 Browse...")
+        btn_browse_lw.setMinimumHeight(34)
+        btn_browse_lw.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_browse_lw.clicked.connect(self.choose_logout_wallpaper_file)
+        h_lwall.addWidget(btn_browse_lw)
+
+        btn_clear_lw = QPushButton("❌ Clear")
+        btn_clear_lw.setMinimumHeight(34)
+        btn_clear_lw.clicked.connect(self.clear_logout_wallpaper_file)
+        h_lwall.addWidget(btn_clear_lw)
+        l_bg.addLayout(h_lwall)
+
+        # Sync buttons row
+        h_sync = QHBoxLayout()
+        h_sync.setSpacing(10)
+        lbl_spc = QLabel("")
+        lbl_spc.setMinimumWidth(160)
+        h_sync.addWidget(lbl_spc)
+
+        btn_sync_login = QPushButton("🖼️ Match Login Screen Wallpaper")
+        btn_sync_login.setMinimumHeight(32)
+        btn_sync_login.clicked.connect(self.match_login_logout_wallpaper)
+        h_sync.addWidget(btn_sync_login)
+
+        btn_sync_lock = QPushButton("🖼️ Match Lock Screen Wallpaper")
+        btn_sync_lock.setMinimumHeight(32)
+        btn_sync_lock.clicked.connect(self.match_lockscreen_logout_wallpaper)
+        h_sync.addWidget(btn_sync_lock)
+        h_sync.addStretch()
+        l_bg.addLayout(h_sync)
+
+        # Opacity Dimming Slider
         h_op = QHBoxLayout()
         h_op.setSpacing(10)
-        lbl_op = QLabel("Backdrop Dim Opacity (%):")
+        lbl_op = QLabel("Wallpaper Dimming (%):")
         lbl_op.setMinimumWidth(160)
         h_op.addWidget(lbl_op)
         self.slider_logout_opacity = QSlider(Qt.Orientation.Horizontal)
@@ -2131,7 +2406,38 @@ class LockscreenConfigApp(QMainWindow):
         h_op.addWidget(self.spin_logout_opacity)
         l_bg.addLayout(h_op)
 
+        # Tint Color
+        self.btn_logout_bg_color = QPushButton()
+        self.txt_logout_bg_color = QLineEdit("#000000")
+        self.txt_logout_bg_color.textChanged.connect(self.on_logout_bg_color_changed)
+        l_bg.addLayout(self.build_color_picker_row(
+            "Backdrop Dim/Tint Color:",
+            self.txt_logout_bg_color,
+            self.btn_logout_bg_color,
+            self.choose_logout_bg_color,
+            self.set_logout_bg_color
+        ))
+
         layout.addWidget(grp_bg)
+
+        # Quick Actions
+        grp_lact = QGroupBox("Logout Actions & Preview")
+        l_lact = QHBoxLayout(grp_lact)
+        l_lact.setSpacing(12)
+
+        btn_tab_test_logout = QPushButton("🚪 Test Logout Screen (Windowed)")
+        btn_tab_test_logout.setMinimumHeight(38)
+        btn_tab_test_logout.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white; border-radius: 6px; padding: 6px 14px;")
+        btn_tab_test_logout.clicked.connect(self.test_logout_screen)
+        l_lact.addWidget(btn_tab_test_logout)
+
+        btn_tab_reset_logout = QPushButton("⏮️ Reset Logout Screen to Stock")
+        btn_tab_reset_logout.setMinimumHeight(38)
+        btn_tab_reset_logout.setStyleSheet("font-weight: bold; background-color: #7f1d1d; color: #fecaca; border: 1px solid #991b1b; border-radius: 6px; padding: 6px 14px;")
+        btn_tab_reset_logout.clicked.connect(self.reset_logout_to_stock)
+        l_lact.addWidget(btn_tab_reset_logout)
+
+        layout.addWidget(grp_lact)
         layout.addStretch()
         self.tabs.addTab(self.wrap_in_scroll_area(tab), "🚪 Logout Screen")
 
@@ -2484,6 +2790,26 @@ class LockscreenConfigApp(QMainWindow):
                 user_fallback_backup=SYSTEM_SDDM_STOCK_BACKUP,
                 parent_widget=self
             )
+            if os.path.exists(SYSTEM_SDDM_BG_QML + ".stock"):
+                try:
+                    restore_system_stock_file(
+                        SYSTEM_SDDM_BG_QML,
+                        stock_backup_path=SYSTEM_SDDM_BG_QML + ".stock",
+                        user_fallback_backup=SYSTEM_SDDM_BG_STOCK_BACKUP,
+                        parent_widget=self
+                    )
+                except Exception:
+                    pass
+            if os.path.exists(SYSTEM_SDDM_THEME_CONF + ".stock"):
+                try:
+                    restore_system_stock_file(
+                        SYSTEM_SDDM_THEME_CONF,
+                        stock_backup_path=SYSTEM_SDDM_THEME_CONF + ".stock",
+                        user_fallback_backup=SYSTEM_SDDM_THEME_CONF_STOCK,
+                        parent_widget=self
+                    )
+                except Exception:
+                    pass
             if os.path.exists(SYSTEM_SDDM_THEME_CONF_USER + ".stock"):
                 try:
                     restore_system_stock_file(
@@ -2493,13 +2819,22 @@ class LockscreenConfigApp(QMainWindow):
                     )
                 except Exception:
                     pass
+            # Remove custom wallpaper copies
+            for item in os.listdir(SYSTEM_SDDM_DIR):
+                if item.startswith("custom_wallpaper."):
+                    try:
+                        p = os.path.join(SYSTEM_SDDM_DIR, item)
+                        write_system_file(p, "", stock_backup_path=None, parent_widget=self)
+                        os.remove(p)
+                    except Exception:
+                        pass
             if os.path.exists(SDDM_QML) and os.path.exists(SYSTEM_SDDM_STOCK_BACKUP):
                 shutil.copy2(SYSTEM_SDDM_STOCK_BACKUP, SDDM_QML)
             if hasattr(self, "lbl_sddm_status"):
                 self.update_sddm_status_badge()
             QMessageBox.information(
                 self, "Reset SDDM Breeze",
-                "SDDM Breeze Login Screen (/usr/share/sddm/themes/breeze/Main.qml) has been successfully restored to stock KDE Breeze defaults!"
+                "SDDM Breeze Login Screen (/usr/share/sddm/themes/breeze) has been successfully restored to stock KDE Breeze defaults!"
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to reset SDDM Breeze:\n{e}")
@@ -2522,9 +2857,8 @@ class LockscreenConfigApp(QMainWindow):
         try:
             if os.path.exists(LOGOUT_QML):
                 os.remove(LOGOUT_QML)
-            src_logout = "/usr/share/plasma/shells/org.kde.plasma.desktop/contents/logout/Logout.qml"
-            if os.path.exists(src_logout):
-                shutil.copy2(src_logout, LOGOUT_QML)
+            if os.path.exists(USER_LOGOUT_DIR):
+                shutil.rmtree(USER_LOGOUT_DIR, ignore_errors=True)
             QMessageBox.information(
                 self, "Reset Logout Screen",
                 "KDE Logout Screen has been restored to default stock behavior!"
@@ -2779,8 +3113,9 @@ class LockscreenConfigApp(QMainWindow):
         self.txt_logout_title.setText(cfg.get("logoutCustomTitle", ""))
         self.spin_logout_title_size.setValue(cfg.get("logoutTitlePointSize", 18))
         self.set_logout_title_color(cfg.get("logoutTitleColor", "#f8fafc"))
-        self.set_logout_bg_color(cfg.get("logoutBgColor", "#0f172a"))
-        self.spin_logout_opacity.setValue(cfg.get("logoutBgOpacity", 75))
+        self.txt_logout_wallpaper.setText(cfg.get("logoutWallpaper", ""))
+        self.set_logout_bg_color(cfg.get("logoutBgColor", "#000000"))
+        self.spin_logout_opacity.setValue(cfg.get("logoutBgOpacity", 35))
 
         # SDDM Login Screen (Breeze) settings
         if hasattr(self, "chk_customize_sddm"):
@@ -2788,7 +3123,7 @@ class LockscreenConfigApp(QMainWindow):
         if hasattr(self, "txt_sddm_bg"):
             self.txt_sddm_bg.setText(cfg.get("sddmBackground", ""))
         if hasattr(self, "txt_sddm_bg_color"):
-            self.set_sddm_bg_color(cfg.get("sddmBackgroundColor", "#2777ff"))
+            self.set_sddm_bg_color(cfg.get("sddmBackgroundColor", "#0f172a"))
         if hasattr(self, "cmb_sddm_logo"):
             self.cmb_sddm_logo.setCurrentText(cfg.get("sddmShowLogo", "hidden"))
         if hasattr(self, "lbl_sddm_status"):
@@ -2993,13 +3328,14 @@ class LockscreenConfigApp(QMainWindow):
             "logoutCustomTitle": self.txt_logout_title.text().strip(),
             "logoutTitlePointSize": self.spin_logout_title_size.value(),
             "logoutTitleColor": self.txt_logout_title_color.text().strip() or "#f8fafc",
-            "logoutBgColor": self.txt_logout_bg_color.text().strip() or "#0f172a",
+            "logoutWallpaper": self.txt_logout_wallpaper.text().strip() if hasattr(self, "txt_logout_wallpaper") else "",
+            "logoutBgColor": self.txt_logout_bg_color.text().strip() or "#000000",
             "logoutBgOpacity": self.spin_logout_opacity.value(),
 
             # SDDM Breeze Login Screen
             "customizeSddmScreen": self.chk_customize_sddm.isChecked() if hasattr(self, "chk_customize_sddm") else True,
             "sddmBackground": self.txt_sddm_bg.text().strip() if hasattr(self, "txt_sddm_bg") else "",
-            "sddmBackgroundColor": self.txt_sddm_bg_color.text().strip() if hasattr(self, "txt_sddm_bg_color") else "#2777ff",
+            "sddmBackgroundColor": self.txt_sddm_bg_color.text().strip() if hasattr(self, "txt_sddm_bg_color") else "#0f172a",
             "sddmShowLogo": self.cmb_sddm_logo.currentText() if hasattr(self, "cmb_sddm_logo") else "hidden",
         }
         return cfg
@@ -3038,10 +3374,9 @@ class LockscreenConfigApp(QMainWindow):
                 build_lockscreen(src_lock, LOCKSCREEN_QML, is_sddm=False)
 
         if not self.is_logout_patched(LOGOUT_QML):
-            src_logout = "/usr/share/plasma/shells/org.kde.plasma.desktop/contents/logout/Logout.qml"
-            if os.path.exists(src_logout):
+            if os.path.exists(SYSTEM_LOGOUT_QML):
                 os.makedirs(os.path.dirname(LOGOUT_QML), exist_ok=True)
-                build_logout_screen(src_logout, LOGOUT_QML)
+                build_logout_screen(SYSTEM_LOGOUT_QML, LOGOUT_QML)
 
         # 2. SDDM Breeze Stock Backup & Local Overlay
         if not os.path.exists(SYSTEM_SDDM_STOCK_BACKUP):
@@ -3068,59 +3403,110 @@ class LockscreenConfigApp(QMainWindow):
                 build_lockscreen(src_sddm, SDDM_QML, is_sddm=True)
 
     def write_system_sddm_config(self, cfg):
-        """Builds and installs custom top clock & animations directly to /usr/share/sddm/themes/breeze/Main.qml"""
+        """Builds and installs custom top clock, uncompressed wallpaper & animations directly to /usr/share/sddm/themes/breeze/Main.qml and Background.qml"""
         src_stock = SYSTEM_SDDM_STOCK_BACKUP if os.path.exists(SYSTEM_SDDM_STOCK_BACKUP) else (
             SYSTEM_SDDM_QML + ".stock" if os.path.exists(SYSTEM_SDDM_QML + ".stock") else SYSTEM_SDDM_QML
         )
         temp_qml = os.path.expanduser("~/.cache/kde-lockscreen-config/sddm_breeze_patched.qml")
         os.makedirs(os.path.dirname(temp_qml), exist_ok=True)
         build_lockscreen(src_stock, temp_qml, is_sddm=True)
+
+        # Handle custom wallpaper installation
+        user_bg = cfg.get("sddmBackground", "").strip()
+        system_bg_installed = ""
+        if user_bg and os.path.isfile(user_bg):
+            try:
+                system_bg_installed = copy_image_to_system_sddm(user_bg, parent_widget=self)
+                cfg["sddmBackgroundSys"] = system_bg_installed
+            except Exception as e:
+                print(f"Warning: could not copy wallpaper to SDDM theme dir: {e}")
+
+        # Ensure Background.qml uses uncompressed full resolution Image
+        try:
+            patch_system_sddm_background_qml(parent_widget=self)
+        except Exception as e:
+            print(f"Warning: patch Background.qml: {e}")
+
         self.write_qml_config(temp_qml, cfg)
 
-        with open(temp_qml, "r") as f:
+        with open(temp_qml, "r", encoding="utf-8") as f:
             final_content = f.read()
 
         write_system_file(SYSTEM_SDDM_QML, final_content, stock_backup_path=SYSTEM_SDDM_QML + ".stock", parent_widget=self)
 
     def write_sddm_theme_conf(self, cfg):
-        """Updates theme.conf.user in /usr/share/sddm/themes/breeze if custom background or color set"""
-        bg = cfg.get("sddmBackground", "").strip()
-        bg_col = cfg.get("sddmBackgroundColor", "#2777ff").strip()
+        """Updates theme.conf and theme.conf.user in /usr/share/sddm/themes/breeze with custom wallpaper and colors"""
+        user_bg = cfg.get("sddmBackground", "").strip()
+        sys_bg = cfg.get("sddmBackgroundSys", "")
+        bg_col = cfg.get("sddmBackgroundColor", "#0f172a").strip()
         logo_opt = cfg.get("sddmShowLogo", "hidden").strip()
 
-        if not bg and not bg_col and not logo_opt:
-            return
+        # Determine effective wallpaper path for theme.conf
+        effective_bg = ""
+        if sys_bg and os.path.exists(sys_bg):
+            effective_bg = sys_bg
+        elif user_bg and os.path.exists(user_bg):
+            effective_bg = user_bg
+        else:
+            if os.path.exists("/usr/share/wallpapers/Next/contents/images/5120x2880.png"):
+                effective_bg = "/usr/share/wallpapers/Next/contents/images/5120x2880.png"
+            elif os.path.exists("/usr/share/desktop-base/kali-theme/login/background"):
+                effective_bg = "/usr/share/desktop-base/kali-theme/login/background"
 
         lines = ["[General]"]
         lines.append("type=image")
-        if bg:
-            lines.append(f"background={bg}")
-        else:
-            lines.append("background=/usr/share/desktop-base/kali-theme/login/background")
-        if bg_col:
-            lines.append(f"color={bg_col}")
-        if logo_opt:
-            lines.append(f"showlogo={logo_opt}")
+        if effective_bg:
+            lines.append(f"background={effective_bg}")
+        lines.append(f"color={bg_col or '#0f172a'}")
+        lines.append(f"showlogo={logo_opt or 'hidden'}")
+        lines.append("logo=/usr/share/sddm/themes/breeze/default-logo.svg")
+        lines.append("fontSize=10")
+        lines.append("showClock=true")
+        lines.append("needsFullUserModel=false")
         lines.append("")
 
         conf_content = "\n".join(lines)
         try:
+            write_system_file(SYSTEM_SDDM_THEME_CONF, conf_content, stock_backup_path=SYSTEM_SDDM_THEME_CONF + ".stock", parent_widget=self)
             write_system_file(SYSTEM_SDDM_THEME_CONF_USER, conf_content, stock_backup_path=SYSTEM_SDDM_THEME_CONF_USER + ".stock", parent_widget=self)
         except Exception as e:
-            print(f"SDDM theme.conf.user update note: {e}")
+            print(f"SDDM theme.conf update note: {e}")
 
     def write_logout_qml_config(self, qml_path, cfg):
-        src_logout = "/usr/share/plasma/shells/org.kde.plasma.desktop/contents/logout/Logout.qml"
+        src_logout = SYSTEM_LOGOUT_QML
         if not os.path.exists(src_logout):
             return
-        if not self.is_logout_patched(qml_path):
-            build_logout_screen(src_logout, qml_path)
 
-        with open(qml_path, "r") as f:
+        # Ensure look-and-feel package files exist in user override
+        user_laf_dir = os.path.dirname(os.path.dirname(qml_path))
+        src_laf_dir = os.path.dirname(os.path.dirname(src_logout))
+        os.makedirs(os.path.join(user_laf_dir, "contents/logout"), exist_ok=True)
+        meta_src = os.path.join(src_laf_dir, "metadata.json")
+        meta_dst = os.path.join(user_laf_dir, "metadata.json")
+        if os.path.exists(meta_src) and not os.path.exists(meta_dst):
+            try:
+                shutil.copy2(meta_src, meta_dst)
+            except Exception:
+                pass
+
+        for supp_file in ["LogoutButton.qml", "timer.js"]:
+            s_f = os.path.join(src_laf_dir, "contents/logout", supp_file)
+            d_f = os.path.join(user_laf_dir, "contents/logout", supp_file)
+            if os.path.exists(s_f) and not os.path.exists(d_f):
+                try:
+                    shutil.copy2(s_f, d_f)
+                except Exception:
+                    pass
+
+        # Build patched version
+        build_logout_screen(src_logout, qml_path)
+
+        with open(qml_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         escaped_title = cfg.get("logoutCustomTitle", "").replace('\\', '\\\\').replace('"', '\\"')
-        bg_opacity = round(cfg.get("logoutBgOpacity", 75) / 100.0, 2)
+        escaped_wall = cfg.get("logoutWallpaper", "").replace('\\', '\\\\').replace('"', '\\"')
+        bg_opacity = round(cfg.get("logoutBgOpacity", 35) / 100.0, 2)
 
         new_logout_cfg = f"""    QtObject {{
         id: logoutCustomConfig
@@ -3143,8 +3529,9 @@ class LockscreenConfigApp(QMainWindow):
         property string customTitle: "{escaped_title}"
         property string titleColor: "{cfg.get('logoutTitleColor', '#f8fafc')}"
         property int titlePointSize: {cfg.get('logoutTitlePointSize', 18)}
+        property string wallpaperPath: "{escaped_wall}"
         property double bgOpacity: {bg_opacity}
-        property string bgColor: "{cfg.get('logoutBgColor', '#0f172a')}"
+        property string bgColor: "{cfg.get('logoutBgColor', '#000000')}"
         property bool showCountdown: true
     }}"""
 
@@ -3155,7 +3542,7 @@ class LockscreenConfigApp(QMainWindow):
             flags=re.MULTILINE | re.DOTALL
         )
         if count > 0:
-            with open(qml_path, "w") as f:
+            with open(qml_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
     def apply_settings(self):
@@ -3284,6 +3671,10 @@ class LockscreenConfigApp(QMainWindow):
 
         // Animations
         property bool enableWindowsGlideAnimation: {str(cfg['enableWindowsGlideAnimation']).lower()}
+
+        // Wallpaper & Fallback Tint
+        property string customWallpaper: "{cfg.get('sddmBackgroundSys', cfg.get('sddmBackground', ''))}"
+        property string wallpaperColor: "{cfg.get('sddmBackgroundColor', '#0f172a')}"
     }}"""
 
         content, count = re.subn(
@@ -3353,17 +3744,17 @@ class LockscreenConfigApp(QMainWindow):
             self.ensure_theme_installed()
             self.write_logout_qml_config(LOGOUT_QML, self.config)
 
-            # Triggers KDE's native logout/shutdown confirmation overlay
-            subprocess.Popen([
-                "qdbus", "org.kde.LogoutPrompt", "/LogoutPrompt", "promptAll"
-            ])
-        except Exception:
+            greeter_bin = "/usr/lib/x86_64-linux-gnu/libexec/ksmserver-logout-greeter"
+            if os.path.exists(greeter_bin):
+                subprocess.Popen([greeter_bin, "--windowed"])
+                return
+
             try:
-                subprocess.Popen([
-                    "qdbus6", "org.kde.LogoutPrompt", "/LogoutPrompt", "promptAll"
-                ])
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Could not invoke KDE LogoutPrompt via qdbus:\n{e}")
+                subprocess.Popen(["qdbus", "org.kde.LogoutPrompt", "/LogoutPrompt", "promptAll"])
+            except Exception:
+                subprocess.Popen(["qdbus6", "org.kde.LogoutPrompt", "/LogoutPrompt", "promptAll"])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not preview Logout screen:\n{e}")
 
     def reset_defaults(self):
         reply = QMessageBox.question(
