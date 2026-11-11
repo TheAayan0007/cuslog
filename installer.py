@@ -8,6 +8,7 @@ Unified installer for desktop utilities:
 
 import argparse
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,9 @@ DEFAULT_BIN_DIR = os.path.expanduser("~/.local/bin")
 DEFAULT_APPS_DIR = os.path.expanduser("~/.local/share/applications")
 USER_SHELL_DIR = os.path.expanduser("~/.local/share/plasma/shells/org.kde.plasma.desktop")
 SYSTEM_SHELL_DIR = "/usr/share/plasma/shells/org.kde.plasma.desktop"
+
+TRIPLE_CLICK_MARKERS = ("import", "helpers", "observer")
+MARKER_PREFIX = "customize-dock-triple-click-"
 
 APPS = {
     "lockscreen-config": {
@@ -32,6 +36,7 @@ APPS = {
         "binary_rel": os.path.join("customize-dock", "customize-dock"),
         "desktop_rel": os.path.join("customize-dock", "customize-dock.desktop"),
         "panel_qml_rel": os.path.join("customize-dock", "Panel.qml"),
+        "compact_applet_qml_rel": os.path.join("customize-dock", "CompactApplet.qml"),
         "python_deps": [("PyQt6", "python3-pyqt6", "PyQt6")],
     },
     "ram-cleaner": {
@@ -164,30 +169,193 @@ def install_desktop_entry(src_desktop, apps_dir, exec_target, dry_run=False):
     print(f"    [✓] Installed launcher: {dest_desktop}")
 
 
-def install_panel_qml(src_qml, dry_run=False):
-    """Install the Plasma 6 Panel.qml override needed for independent top-bar styling."""
-    dest_qml = os.path.join(USER_SHELL_DIR, "contents", "views", "Panel.qml")
-    if dry_run:
-        print(f"    [dry-run] Would install Plasma Panel.qml override: {dest_qml}")
+def ensure_user_shell_dir(dry_run=False):
+    """Ensure the user Plasma desktop shell override directory exists."""
+    if os.path.exists(USER_SHELL_DIR):
         return
+    if not os.path.exists(SYSTEM_SHELL_DIR):
+        return
+    if dry_run:
+        print(f"    [dry-run] Would copy Plasma shell base: {SYSTEM_SHELL_DIR} -> {USER_SHELL_DIR}")
+        return
+    shutil.copytree(SYSTEM_SHELL_DIR, USER_SHELL_DIR)
 
-    if not os.path.exists(USER_SHELL_DIR) and os.path.exists(SYSTEM_SHELL_DIR):
-        shutil.copytree(SYSTEM_SHELL_DIR, USER_SHELL_DIR)
 
+def backup_existing_file(path):
+    """Create a one-time .bak copy before overwriting an existing file."""
+    if not os.path.lexists(path):
+        return
+    backup = path + ".bak"
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    remove_existing_path(path)
+
+
+def install_shell_file(src_qml, rel_dest, label, dry_run=False):
+    """Install a Plasma shell QML override file and return True if modified."""
+    dest_qml = os.path.join(USER_SHELL_DIR, rel_dest)
+    if dry_run:
+        if files_identical(src_qml, dest_qml):
+            print(f"    [✓] Plasma {label} override already up to date: {dest_qml}")
+            return False
+        print(f"    [dry-run] Would install Plasma {label} override: {dest_qml}")
+        return True
+
+    ensure_user_shell_dir(dry_run=False)
     os.makedirs(os.path.dirname(dest_qml), exist_ok=True)
     if files_identical(src_qml, dest_qml):
-        print(f"    [✓] Plasma Panel.qml override already up to date: {dest_qml}")
-        return
+        print(f"    [✓] Plasma {label} override already up to date: {dest_qml}")
+        return False
 
-    if os.path.lexists(dest_qml):
-        backup = dest_qml + ".bak"
-        if not os.path.exists(backup):
-            shutil.copy2(dest_qml, backup)
-        remove_existing_path(dest_qml)
-
+    backup_existing_file(dest_qml)
     shutil.copy2(src_qml, dest_qml)
     os.chmod(dest_qml, 0o644)
-    print(f"    [✓] Installed Plasma Panel.qml override: {dest_qml}")
+    print(f"    [✓] Installed Plasma {label} override: {dest_qml}")
+    return True
+
+
+def _marker_regex(name):
+    start = re.escape(f"// >>> {MARKER_PREFIX}{name}")
+    end = re.escape(f"// <<< {MARKER_PREFIX}{name}")
+    return re.compile(rf"\n?{start}\n.*?\n{end}", re.DOTALL)
+
+
+def extract_marked_blocks(qml_text):
+    """Extract the marked triple-click QML blocks from the bundled CompactApplet.qml."""
+    blocks = {}
+    for name in TRIPLE_CLICK_MARKERS:
+        start = f"// >>> {MARKER_PREFIX}{name}"
+        end = f"// <<< {MARKER_PREFIX}{name}"
+        match = re.search(rf"({re.escape(start)}\n.*?\n{re.escape(end)})", qml_text, re.DOTALL)
+        if not match:
+            raise ValueError(f"Missing marker block '{name}' in bundled CompactApplet.qml")
+        blocks[name] = match.group(1)
+    return blocks
+
+
+def strip_marked_blocks(qml_text):
+    """Remove any previously injected triple-click marker blocks from CompactApplet.qml."""
+    cleaned = qml_text
+    for name in TRIPLE_CLICK_MARKERS:
+        cleaned = _marker_regex(name).sub("", cleaned)
+    return cleaned
+
+
+def apply_compact_applet_patch(base_text, blocks):
+    """Inject triple-click blocks into a Plasma 6 CompactApplet.qml; return None if anchors fail."""
+    cleaned = strip_marked_blocks(base_text)
+    anchors = [
+        ("import", "import org.kde.kirigami as Kirigami"),
+        ("helpers", "    property PlasmoidItem plasmoidItem"),
+    ]
+    patched = cleaned
+    for name, anchor in anchors:
+        if patched.count(anchor) != 1:
+            return None
+        patched = patched.replace(anchor, f"{anchor}\n{blocks[name]}", 1)
+
+    keys_anchor = (
+        "        Keys.onPressed: event => {\n"
+        "            switch (event.key) {\n"
+        "            case Qt.Key_Space:\n"
+        "            case Qt.Key_Enter:\n"
+        "            case Qt.Key_Return:\n"
+        "            case Qt.Key_Select:\n"
+        "                Plasmoid.activated();\n"
+        "                break;\n"
+        "            }\n"
+        "        }"
+    )
+    focus_anchor = (
+        "    FocusScope {\n"
+        "        id: compactRepresentationParent\n"
+        "        anchors.fill: parent"
+    )
+    if patched.count(keys_anchor) == 1:
+        patched = patched.replace(keys_anchor, f"{keys_anchor}\n{blocks['observer']}", 1)
+    elif patched.count(focus_anchor) == 1:
+        patched = patched.replace(focus_anchor, f"{focus_anchor}\n{blocks['observer']}", 1)
+    else:
+        return None
+    return patched
+
+
+def install_compact_applet_qml(src_qml, dry_run=False):
+    """Patch target PC's CompactApplet.qml with triple-click toggle (or copy fallback)."""
+    rel_dest = os.path.join("contents", "applet", "CompactApplet.qml")
+    dest_qml = os.path.join(USER_SHELL_DIR, rel_dest)
+    sys_qml = os.path.join(SYSTEM_SHELL_DIR, rel_dest)
+
+    with open(src_qml, "r", encoding="utf-8") as f:
+        blocks = extract_marked_blocks(f.read())
+
+    # On a fresh system during --dry-run, inspect system CompactApplet.qml if user copy doesn't exist yet
+    read_path = dest_qml if os.path.isfile(dest_qml) else (sys_qml if dry_run and os.path.isfile(sys_qml) else None)
+    if read_path is None:
+        return install_shell_file(src_qml, rel_dest, "CompactApplet.qml", dry_run=dry_run)
+
+    with open(read_path, "r", encoding="utf-8") as f:
+        current_text = f.read()
+
+    patched_text = apply_compact_applet_patch(current_text, blocks)
+    if patched_text is None:
+        return install_shell_file(src_qml, rel_dest, "CompactApplet.qml", dry_run=dry_run)
+
+    if os.path.isfile(dest_qml) and current_text == patched_text:
+        print(f"    [✓] Plasma CompactApplet.qml triple-click toggle already up to date: {dest_qml}")
+        return False
+
+    if dry_run:
+        print(f"    [dry-run] Would patch Plasma CompactApplet.qml triple-click toggle: {dest_qml}")
+        return True
+
+    ensure_user_shell_dir(dry_run=False)
+    os.makedirs(os.path.dirname(dest_qml), exist_ok=True)
+    backup_existing_file(dest_qml)
+    with open(dest_qml, "w", encoding="utf-8") as f:
+        f.write(patched_text)
+    os.chmod(dest_qml, 0o644)
+    print(f"    [✓] Installed Plasma CompactApplet.qml triple-click toggle: {dest_qml}")
+    return True
+
+
+def uninstall_compact_applet_qml(dry_run=False):
+    """Remove injected triple-click blocks from CompactApplet.qml if present."""
+    dest_qml = os.path.join(USER_SHELL_DIR, "contents", "applet", "CompactApplet.qml")
+    if not os.path.isfile(dest_qml):
+        return False
+    with open(dest_qml, "r", encoding="utf-8") as f:
+        current_text = f.read()
+    stripped_text = strip_marked_blocks(current_text)
+    if stripped_text == current_text:
+        return False
+    if dry_run:
+        print(f"    [dry-run] Would remove triple-click toggle patch from: {dest_qml}")
+        return True
+    with open(dest_qml, "w", encoding="utf-8") as f:
+        f.write(stripped_text)
+    os.chmod(dest_qml, 0o644)
+    print(f"    [✓] Removed triple-click toggle patch from: {dest_qml}")
+    return True
+
+
+def restart_plasmashell_if_running(dry_run=False):
+    """Reload plasma-plasmashell so shell QML overrides take effect immediately."""
+    if dry_run:
+        print("[dry-run] Would restart plasma-plasmashell.service if running.")
+        return
+    if shutil.which("systemctl"):
+        check = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", "plasma-plasmashell"],
+            check=False,
+        )
+        if check.returncode == 0:
+            subprocess.run(["systemctl", "--user", "reset-failed", "plasma-plasmashell"], check=False)
+            res = subprocess.run(["systemctl", "--user", "restart", "plasma-plasmashell"], check=False)
+            if res.returncode == 0:
+                print("[✓] Reloaded KDE Plasma shell (plasma-plasmashell.service).")
+                return
+    print("[!] Restart plasmashell or log out and back in for Plasma QML overrides to take effect.")
 
 
 def link_globally(app_name, bin_path, dry_run=False):
@@ -228,6 +396,7 @@ def install_all(args):
     if not args.skip_deps:
         ensure_dependencies(selected, dry_run=args.dry_run)
 
+    qml_changed = False
     for app_name in selected:
         meta = APPS[app_name]
         print(f"\n==> Installing {app_name}: {meta['description']}")
@@ -247,12 +416,21 @@ def install_all(args):
         if meta.get("panel_qml_rel") and not args.skip_qml:
             src_qml = os.path.join(SCRIPT_DIR, meta["panel_qml_rel"])
             if os.path.isfile(src_qml):
-                install_panel_qml(src_qml, dry_run=args.dry_run)
+                qml_changed |= install_shell_file(
+                    src_qml, os.path.join("contents", "views", "Panel.qml"), "Panel.qml", dry_run=args.dry_run
+                )
+
+        if meta.get("compact_applet_qml_rel") and not args.skip_qml:
+            src_compact_qml = os.path.join(SCRIPT_DIR, meta["compact_applet_qml_rel"])
+            if os.path.isfile(src_compact_qml):
+                qml_changed |= install_compact_applet_qml(src_compact_qml, dry_run=args.dry_run)
 
         if args.global_link:
             link_globally(app_name, dest_bin, dry_run=args.dry_run)
 
     refresh_desktop_cache(args.apps_dir, dry_run=args.dry_run)
+    if qml_changed:
+        restart_plasmashell_if_running(dry_run=args.dry_run)
 
     path_entries = [os.path.normpath(p) for p in os.environ.get("PATH", "").split(":") if p]
     if os.path.normpath(args.bin_dir) not in path_entries:
@@ -272,6 +450,7 @@ def install_all(args):
 def uninstall_all(args):
     selected = args.only or list(APPS.keys())
     print(f"[*] Uninstalling: {', '.join(selected)}")
+    qml_changed = False
     for app_name in selected:
         meta = APPS[app_name]
         bin_path = os.path.join(args.bin_dir, app_name)
@@ -291,6 +470,9 @@ def uninstall_all(args):
                     remove_existing_path(desktop_path)
                     print(f"    [✓] Removed: {desktop_path}")
 
+        if meta.get("compact_applet_qml_rel") and not args.skip_qml:
+            qml_changed |= uninstall_compact_applet_qml(dry_run=args.dry_run)
+
         global_path = os.path.join("/usr/local/bin", app_name)
         if args.global_link and os.path.lexists(global_path):
             if args.dry_run:
@@ -303,6 +485,8 @@ def uninstall_all(args):
                 print(f"    [✓] Removed global symlink: {global_path}")
 
     refresh_desktop_cache(args.apps_dir, dry_run=args.dry_run)
+    if qml_changed:
+        restart_plasmashell_if_running(dry_run=args.dry_run)
     print("[✓] Uninstall finished.")
     return 0
 
@@ -341,7 +525,7 @@ def main():
     parser.add_argument(
         "--skip-qml",
         action="store_true",
-        help="Skip installing the KDE Plasma Panel.qml override for customize-dock",
+        help="Skip installing KDE Plasma shell QML overrides (Panel.qml and CompactApplet.qml) for customize-dock",
     )
     parser.add_argument(
         "--dry-run",
