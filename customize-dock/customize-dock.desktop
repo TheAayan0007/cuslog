@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Customize Dock & Panels
+GenericName=Dock & Panel Customizer
+Comment=Customize KDE Plasma bottom dock and top bar curves, heights, transparency, size, and blur
+Exec=/home/windows/.local/bin/customize-dock
+Icon=preferences-desktop-theme
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;Qt;KDE;Utility;
+Keywords=dock;task manager;panel;topbar;blur;transparency;radius;curve;size;

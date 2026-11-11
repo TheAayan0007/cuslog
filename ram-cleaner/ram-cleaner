@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""
+==============================================================================
+RAM Cleaner & Memory Optimizer
+Quits unnecessary idle software, background scripts, and leaked daemons
+to bring memory usage down to a target goal (e.g. 1.7 - 1.8 GB).
+==============================================================================
+"""
+
+import sys
+import os
+import time
+import argparse
+import subprocess
+import signal
+from collections import defaultdict
+import psutil
+
+# ANSI color styling
+class Colors:
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+# Disable colors if not running in a terminal
+if not sys.stdout.isatty():
+    for attr in dir(Colors):
+        if not attr.startswith("__"):
+            setattr(Colors, attr, "")
+
+# Protected process names and binaries (exact match on name or basename)
+PROTECTED_EXACT_NAMES = {
+    # System core, Init & Daemons
+    "systemd", "sd-pam", "kthreadd", "dbus-daemon", "systemd-udevd", "cron",
+    "rtkit-daemon", "accounts-daemon", "polkitd", "upowerd", "udisksd",
+    "networkmanager", "wpa_supplicant", "sshd", "sudo", "su", "login",
+    "getty", "haveged", "systemd-logind", "systemd-journald", "systemd-timesyncd",
+    # Audio Subsystem
+    "pipewire", "wireplumber", "pipewire-pulse", "mpris-proxy", "pulseaudio",
+    # Display Servers & Desktop Window Manager (KDE / Wayland / X11)
+    "xorg", "xwayland", "kwin", "kwin_wayland", "kwin_wayland_wrapper", "kwin_x11",
+    "startplasma-wayland", "plasmashell", "ksmserver", "kded6", "krunner",
+    "kactivitymanagerd", "org_kde_powerdevil", "polkit-kde-authentication-agent-1",
+    "kaccess", "ksecretd", "kwalletd6", "gnome-shell", "mutter", "xfwm4",
+    "xfce4-session", "xfdesktop", "xfce4-panel", "sddm", "sddm-helper",
+    # Hardware applets
+    "blueman-applet", "blueman-tray", "bluetoothd",
+    # Terminal Emulators & Shells
+    "konsole", "alacritty", "kitty", "gnome-terminal", "xterm", "tilix", "tmux", "screen",
+    # Development IDE & Active Agent (Antigravity session protection)
+    "antigravity", "language_server", "hub"
+}
+
+# Known applications eligible for quitting when idle
+KNOWN_APP_DEFINITIONS = [
+    {
+        "id": "spotify",
+        "name": "Spotify Music Player",
+        "match": lambda name, cmd: "spotify" in name or "spotify" in cmd,
+        "systemd_unit": "app-spotify*",
+        "type": "app"
+    },
+    {
+        "id": "discord",
+        "name": "Discord Client",
+        "match": lambda name, cmd: any(k in name or k in cmd for k in ["discord", "vesktop", "webcord", "armcord"]),
+        "systemd_unit": "app-discord*",
+        "type": "app"
+    },
+    {
+        "id": "steam",
+        "name": "Steam Gaming Client",
+        "match": lambda name, cmd: "steam" in name or "steamwebhelper" in name,
+        "systemd_unit": "app-steam*",
+        "type": "app"
+    },
+    {
+        "id": "slack",
+        "name": "Slack Client",
+        "match": lambda name, cmd: "slack" in name or "slack" in cmd.split()[:1],
+        "systemd_unit": "app-slack*",
+        "type": "app"
+    },
+    {
+        "id": "telegram",
+        "name": "Telegram Desktop",
+        "match": lambda name, cmd: "telegram-desktop" in name or "telegram-desktop" in cmd,
+        "systemd_unit": "app-telegram*",
+        "type": "app"
+    },
+    {
+        "id": "signal",
+        "name": "Signal Messenger",
+        "match": lambda name, cmd: "signal-desktop" in name or "signal-desktop" in cmd,
+        "systemd_unit": "app-signal*",
+        "type": "app"
+    },
+    {
+        "id": "whatsapp",
+        "name": "WhatsApp Desktop",
+        "match": lambda name, cmd: "whatsapp-for-linux" in name or "whatsapp-for-linux" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "element",
+        "name": "Element Matrix Client",
+        "match": lambda name, cmd: "element-desktop" in name or "element-desktop" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "skype",
+        "name": "Skype Client",
+        "match": lambda name, cmd: "skypeforlinux" in name or "skypeforlinux" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "zoom",
+        "name": "Zoom Workplace",
+        "match": lambda name, cmd: "zoom" in name or "zoom" in cmd.split()[:1],
+        "type": "app"
+    },
+    {
+        "id": "vlc",
+        "name": "VLC Media Player",
+        "match": lambda name, cmd: "vlc" in name or "vlc" in cmd.split()[:1],
+        "type": "app"
+    },
+    {
+        "id": "mpv",
+        "name": "MPV Media Player",
+        "match": lambda name, cmd: "mpv" in name or "mpv" in cmd.split()[:1],
+        "type": "app"
+    },
+    {
+        "id": "qbittorrent",
+        "name": "qBittorrent Downloader",
+        "match": lambda name, cmd: "qbittorrent" in name or "qbittorrent" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "transmission",
+        "name": "Transmission BitTorrent",
+        "match": lambda name, cmd: any(k in name for k in ["transmission-gtk", "transmission-qt", "transmission-daemon"]),
+        "type": "app"
+    },
+    {
+        "id": "deluge",
+        "name": "Deluge BitTorrent",
+        "match": lambda name, cmd: "deluge" in name or "deluge" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "obsidian",
+        "name": "Obsidian Note Taking",
+        "match": lambda name, cmd: "obsidian" in name or "obsidian" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "postman",
+        "name": "Postman API Platform",
+        "match": lambda name, cmd: "postman" in name or "postman" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "insomnia",
+        "name": "Insomnia REST Client",
+        "match": lambda name, cmd: "insomnia" in name or "insomnia" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "dropbox",
+        "name": "Dropbox Cloud Sync",
+        "match": lambda name, cmd: "dropbox" in name or "dropbox" in cmd.split()[:1],
+        "type": "app"
+    },
+    {
+        "id": "nextcloud",
+        "name": "Nextcloud Desktop Sync",
+        "match": lambda name, cmd: "nextcloud" in name or "nextcloud" in cmd,
+        "type": "app"
+    },
+    {
+        "id": "sddm-greeter",
+        "name": "Leaked SDDM Login Greeter",
+        "match": lambda name, cmd: "sddm-greeter" in name or "sddm-greeter" in cmd,
+        "requires_root": True,
+        "type": "leaked_daemon"
+    }
+]
+
+# Web browser definitions (included with --include-browsers or --aggressive)
+BROWSER_DEFINITIONS = [
+    {
+        "id": "chrome",
+        "name": "Google Chrome",
+        "match": lambda name, cmd: any(k in name or k in cmd.split()[:1] for k in ["google-chrome", "chrome", "google-chrome-stable"]),
+        "type": "browser"
+    },
+    {
+        "id": "chromium",
+        "name": "Chromium Browser",
+        "match": lambda name, cmd: "chromium" in name or "chromium" in cmd.split()[:1],
+        "type": "browser"
+    },
+    {
+        "id": "firefox",
+        "name": "Mozilla Firefox",
+        "match": lambda name, cmd: "firefox" in name or "firefox" in cmd.split()[:1],
+        "type": "browser"
+    },
+    {
+        "id": "brave",
+        "name": "Brave Browser",
+        "match": lambda name, cmd: "brave" in name or "brave" in cmd.split()[:1],
+        "type": "browser"
+    },
+    {
+        "id": "edge",
+        "name": "Microsoft Edge",
+        "match": lambda name, cmd: "msedge" in name or "msedge" in cmd.split()[:1],
+        "type": "browser"
+    },
+    {
+        "id": "opera",
+        "name": "Opera Browser",
+        "match": lambda name, cmd: "opera" in name or "opera" in cmd.split()[:1],
+        "type": "browser"
+    },
+    {
+        "id": "vivaldi",
+        "name": "Vivaldi Browser",
+        "match": lambda name, cmd: "vivaldi" in name or "vivaldi" in cmd.split()[:1],
+        "type": "browser"
+    }
+]
+
+class MemoryCandidate:
+    def __init__(self, key, display_name, group_type, systemd_unit=None, requires_root=False):
+        self.key = key
+        self.display_name = display_name
+        self.group_type = group_type
+        self.systemd_unit = systemd_unit
+        self.requires_root = requires_root
+        self.pids = []
+        self.total_rss = 0
+        self.total_cpu = 0.0
+
+    def add_process(self, pid, rss, cpu):
+        self.pids.append(pid)
+        self.total_rss += rss
+        self.total_cpu += cpu
+
+    @property
+    def total_mb(self):
+        return self.total_rss / (1024 * 1024)
+
+    @property
+    def total_gb(self):
+        return self.total_rss / (1024 * 1024 * 1024)
+
+def get_ancestor_pids():
+    """Gathers all ancestor PIDs up to PID 1 to ensure caller and shell are never killed."""
+    ancestors = set()
+    try:
+        p = psutil.Process(os.getpid())
+        while p:
+            ancestors.add(p.pid)
+            p = p.parent()
+    except Exception:
+        pass
+    return ancestors
+
+def is_protected_process(p_info, ancestors):
+    """Checks if a process is critical to the OS or current interactive session."""
+    pid = p_info["pid"]
+    if pid in ancestors or pid == 1:
+        return True
+
+    name = (p_info.get("name") or "").lower()
+    if name in PROTECTED_EXACT_NAMES:
+        return True
+
+    cmdline_list = p_info.get("cmdline") or []
+    if cmdline_list:
+        exe_basename = os.path.basename(cmdline_list[0]).lower()
+        if exe_basename in PROTECTED_EXACT_NAMES:
+            return True
+        # Antigravity IDE and sub-processes protection
+        if "antigravity" in exe_basename or "antigravity" in cmdline_list[0].lower():
+            return True
+
+    return False
+
+def scan_candidates(include_browsers=False, aggressive=False):
+    """Scans running processes and classifies candidate apps and idle scripts."""
+    ancestors = get_ancestor_pids()
+    
+    # 1. Sample CPU across all processes
+    raw_procs = []
+    for p in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'terminal', 'status']):
+        try:
+            p.cpu_percent(interval=None)
+            raw_procs.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    time.sleep(0.15)
+
+    proc_data = []
+    for p in raw_procs:
+        try:
+            cpu = p.cpu_percent(interval=None)
+            mem = p.info['memory_info'].rss if p.info.get('memory_info') else 0
+            proc_data.append((p.info, mem, cpu))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    candidates = {}
+    active_definitions = list(KNOWN_APP_DEFINITIONS)
+    if include_browsers or aggressive:
+        active_definitions.extend(BROWSER_DEFINITIONS)
+
+    for p_info, rss, cpu in proc_data:
+        pid = p_info["pid"]
+        name = (p_info.get("name") or "").lower()
+        cmd_list = p_info.get("cmdline") or []
+        cmd_str = " ".join(cmd_list).lower()
+
+        # Step A: Match against known applications first
+        matched_known = False
+        for app in active_definitions:
+            if app["match"](name, cmd_str):
+                if pid in ancestors:
+                    continue
+                key = app["id"]
+                if key not in candidates:
+                    candidates[key] = MemoryCandidate(
+                        key, app["name"], app["type"],
+                        systemd_unit=app.get("systemd_unit"),
+                        requires_root=app.get("requires_root", False)
+                    )
+                candidates[key].add_process(pid, rss, cpu)
+                matched_known = True
+                break
+
+        if matched_known:
+            continue
+
+        # Step B: Check protected process whitelist
+        if is_protected_process(p_info, ancestors):
+            continue
+
+        # Step C: Detect idle background scripts (python, node, ruby, php, bash)
+        script_interpreters = ["python", "python3", "node", "ruby", "php", "perl"]
+        is_interpreter = any(name == interp or name.startswith(interp) for interp in script_interpreters)
+
+        if is_interpreter and rss > 20 * 1024 * 1024: # > 20MB
+            is_idle = cpu < 1.0
+            is_detached = p_info.get("terminal") is None
+            
+            if is_idle and is_detached:
+                script_label = "Background Worker"
+                if len(cmd_list) > 1:
+                    script_label = os.path.basename(cmd_list[1])
+                key = f"script_{pid}"
+                cand = MemoryCandidate(key, f"Idle Script: {name} ({script_label})", "script")
+                cand.add_process(pid, rss, cpu)
+                candidates[key] = cand
+
+        # Step D: Detect zombie / defunct processes
+        if p_info.get("status") == psutil.STATUS_ZOMBIE:
+            key = f"zombie_{pid}"
+            cand = MemoryCandidate(key, f"Defunct/Zombie Process (PID {pid})", "zombie")
+            cand.add_process(pid, rss, cpu)
+            candidates[key] = cand
+
+    candidate_list = [c for c in candidates.values() if c.total_rss > 0]
+    candidate_list.sort(key=lambda x: x.total_rss, reverse=True)
+    return candidate_list
+
+def drop_kernel_caches():
+    """Flushes Linux pagecache, dentries, and inodes via /proc/sys/vm/drop_caches."""
+    try:
+        if os.geteuid() == 0:
+            os.system("sync")
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("3\n")
+            return True, "Kernel pagecache & directory caches dropped."
+        else:
+            ret = subprocess.run(
+                ["sudo", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"],
+                capture_output=True, text=True
+            )
+            if ret.returncode == 0:
+                return True, "Kernel pagecache & directory caches dropped via sudo."
+            else:
+                return False, "Sudo password required to drop kernel caches."
+    except Exception as e:
+        return False, str(e)
+
+def terminate_candidate(candidate, dry_run=False):
+    """
+    Terminates candidate processes cleanly using systemd stop if available,
+    falling back to SIGTERM and SIGKILL.
+    """
+    if dry_run:
+        return "dry_run", 0
+
+    # 1. If application is registered as a user systemd service (e.g. app-spotify* on KDE Plasma)
+    if candidate.systemd_unit and os.geteuid() != 0:
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "stop", candidate.systemd_unit],
+                capture_output=True, text=True, timeout=3
+            )
+            time.sleep(0.3)
+            # Check if processes are gone
+            any_alive = any(psutil.pid_exists(p) for p in candidate.pids)
+            if not any_alive:
+                return "done", len(candidate.pids)
+        except Exception:
+            pass
+
+    # 2. If candidate requires root privileges (like sddm-greeter)
+    if candidate.requires_root and os.geteuid() != 0:
+        killed_count = 0
+        for pid in candidate.pids:
+            try:
+                res = subprocess.run(["sudo", "kill", "-9", str(pid)])
+                if res.returncode == 0:
+                    killed_count += 1
+            except Exception:
+                pass
+        
+        # In case there are child/zombie greeter processes
+        subprocess.run(["sudo", "pkill", "-9", "-f", "sddm-greeter"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.3)
+
+        # Verify if PIDs actually died
+        still_alive = [p for p in candidate.pids if psutil.pid_exists(p)]
+        if still_alive:
+            return "needs_sudo", 0
+        return "done", len(candidate.pids)
+
+    # 3. Standard SIGTERM -> SIGKILL flow
+    killed_count = 0
+    active_procs = []
+
+    for pid in candidate.pids:
+        try:
+            p = psutil.Process(pid)
+            p.terminate()
+            active_procs.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    gone, alive = psutil.wait_procs(active_procs, timeout=1.0)
+    killed_count += len(gone)
+
+    for p in alive:
+        try:
+            p.kill()
+            killed_count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    time.sleep(0.2)
+    still_alive = [p for p in candidate.pids if psutil.pid_exists(p)]
+    if still_alive:
+        return "needs_sudo", killed_count
+    return "done", killed_count
+
+def render_ram_bar(used_bytes, total_bytes, width=22):
+    """Renders a colored ASCII progress bar representing RAM usage."""
+    ratio = min(max(used_bytes / total_bytes, 0.0), 1.0)
+    filled = int(round(width * ratio))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = ratio * 100
+    
+    if pct < 25:
+        color = Colors.GREEN
+    elif pct < 60:
+        color = Colors.YELLOW
+    else:
+        color = Colors.RED
+        
+    return f"{color}[{bar}] {used_bytes / (1024**3):.2f} GB / {total_bytes / (1024**3):.2f} GB ({pct:.1f}%){Colors.RESET}"
+
+def print_header(target_gb):
+    vm = psutil.virtual_memory()
+    used_gb = vm.used / (1024**3)
+    needed_gb = max(0.0, used_gb - target_gb)
+    
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'=' * 68}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}            ⚡  RAM CLEANER & MEMORY OPTIMIZER  ⚡{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'=' * 68}{Colors.RESET}")
+    print(f"  {Colors.BOLD}Current Memory :{Colors.RESET} {render_ram_bar(vm.used, vm.total)}")
+    print(f"  {Colors.BOLD}Target Goal    :{Colors.RESET} {Colors.GREEN}{target_gb:.2f} GB{Colors.RESET}")
+    if needed_gb > 0:
+        print(f"  {Colors.BOLD}Need to Free   :{Colors.RESET} {Colors.YELLOW}{needed_gb:.2f} GB{Colors.RESET}")
+    else:
+        print(f"  {Colors.BOLD}Status         :{Colors.RESET} {Colors.GREEN}✓ Memory is already below target!{Colors.RESET}")
+    print(f"{Colors.CYAN}{'-' * 68}{Colors.RESET}\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Clean idle/unnecessary software and scripts to bring RAM down to target goal (e.g. 1.7 - 1.8 GB)."
+    )
+    parser.add_argument(
+        "--target", "-t", type=float, default=1.8,
+        help="Target RAM usage in GB (default: 1.8 GB)"
+    )
+    parser.add_argument(
+        "--auto", "-y", action="store_true",
+        help="Auto-clean mode: automatically quit candidates until target RAM is met without prompting"
+    )
+    parser.add_argument(
+        "--all", "-a", action="store_true",
+        help="Quit all detected idle software regardless of whether target is met"
+    )
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true",
+        help="Simulate run without actually quitting any applications"
+    )
+    parser.add_argument(
+        "--include-browsers", "-b", action="store_true",
+        help="Include web browsers (Chrome, Firefox, Chromium, Brave) in candidates"
+    )
+    parser.add_argument(
+        "--aggressive", action="store_true",
+        help="Aggressive cleanup: include browsers and all idle background dev workers"
+    )
+    parser.add_argument(
+        "--drop-cache", "-c", action="store_true",
+        help="Flush kernel pagecache and directory buffers via drop_caches"
+    )
+    parser.add_argument(
+        "--status", "-s", action="store_true",
+        help="Show current memory statistics and candidate apps without making changes"
+    )
+
+    args = parser.parse_args()
+
+    # Drop caches early if explicitly requested
+    if args.drop_cache:
+        success, msg = drop_kernel_caches()
+        if success:
+            print(f"{Colors.GREEN}[✓] {msg}{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}[!] {msg}{Colors.RESET}")
+
+    print_header(args.target)
+
+    # Scan processes
+    print(f"{Colors.DIM}[*] Scanning running processes and idle applications...{Colors.RESET}")
+    candidates = scan_candidates(
+        include_browsers=args.include_browsers,
+        aggressive=args.aggressive
+    )
+
+    if not candidates:
+        print(f"{Colors.GREEN}[✓] No idle/unnecessary applications detected! Your system is clean.{Colors.RESET}")
+        vm = psutil.virtual_memory()
+        print(f"Current used RAM: {vm.used / (1024**3):.2f} GB\n")
+        return
+
+    # Print candidate list table
+    print(f"\n{Colors.BOLD}Detected Quittable Software & Scripts:{Colors.RESET}")
+    print(f"{'#':<3} | {'Application / Script':<34} | {'PIDs':<5} | {'Memory (MB)':<12} | {'Category'}")
+    print("-" * 68)
+    
+    for idx, c in enumerate(candidates, 1):
+        type_badge = f"{Colors.BLUE}[App]{Colors.RESET}"
+        if c.group_type == "script":
+            type_badge = f"{Colors.YELLOW}[Script]{Colors.RESET}"
+        elif c.group_type == "browser":
+            type_badge = f"{Colors.MAGENTA}[Browser]{Colors.RESET}"
+        elif c.group_type == "leaked_daemon":
+            type_badge = f"{Colors.RED}[Leaked]{Colors.RESET}"
+            
+        print(f"{idx:<3} | {c.display_name:<34} | {len(c.pids):<5} | {c.total_mb:>9.1f} MB | {type_badge}")
+
+    total_candidate_mb = sum(c.total_mb for c in candidates)
+    print("-" * 68)
+    print(f"{Colors.BOLD}Total Reclaimable Memory from Candidates: {Colors.GREEN}{total_candidate_mb / 1024:.2f} GB ({total_candidate_mb:.1f} MB){Colors.RESET}\n")
+
+    if args.status:
+        return
+
+    vm_before = psutil.virtual_memory()
+    initial_used_gb = vm_before.used / (1024**3)
+
+    if initial_used_gb <= args.target:
+        print(f"{Colors.GREEN}[✓] RAM usage ({initial_used_gb:.2f} GB) is already below your target of {args.target:.2f} GB.{Colors.RESET}")
+        print("No applications need to be stopped.")
+        return
+
+    needed_to_free_gb = initial_used_gb - args.target
+
+    # Selection logic
+    selected_candidates = []
+
+    if args.all:
+        selected_candidates = candidates
+    elif args.auto:
+        accumulated_gb = 0.0
+        for c in candidates:
+            selected_candidates.append(c)
+            accumulated_gb += c.total_gb
+            if accumulated_gb >= needed_to_free_gb:
+                break
+    else:
+        print(f"{Colors.BOLD}Actions:{Colors.RESET}")
+        print(f"  {Colors.GREEN}[1]{Colors.RESET} Auto-quit to reach target ({args.target:.2f} GB)")
+        print(f"  {Colors.YELLOW}[2]{Colors.RESET} Quit all detected candidates ({total_candidate_mb / 1024:.2f} GB)")
+        print(f"  {Colors.CYAN}[3]{Colors.RESET} Select specific apps to quit (by number)")
+        print(f"  {Colors.MAGENTA}[c]{Colors.RESET} Flush kernel caches via drop_caches")
+        print(f"  {Colors.DIM}[q]{Colors.RESET} Cancel and exit")
+
+        try:
+            choice = input(f"\n{Colors.BOLD}Enter choice [1/2/3/c/q] (default: 1): {Colors.RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            return
+
+        if choice in ["", "1"]:
+            accumulated_gb = 0.0
+            for c in candidates:
+                selected_candidates.append(c)
+                accumulated_gb += c.total_gb
+                if accumulated_gb >= needed_to_free_gb:
+                    break
+        elif choice == "2":
+            selected_candidates = candidates
+        elif choice == "3":
+            try:
+                raw_nums = input("Enter comma-separated numbers to quit (e.g. 1, 2): ").strip()
+                indexes = [int(n.strip()) for n in raw_nums.split(",") if n.strip().isdigit()]
+                selected_candidates = [candidates[i - 1] for i in indexes if 1 <= i <= len(candidates)]
+            except Exception:
+                print(f"{Colors.RED}Invalid selection. Aborted.{Colors.RESET}")
+                return
+        elif choice == "c":
+            success, msg = drop_kernel_caches()
+            print(f"{Colors.GREEN if success else Colors.YELLOW}[*] {msg}{Colors.RESET}")
+            return
+        else:
+            print("Cancelled. No changes made.")
+            return
+
+    if not selected_candidates:
+        print("No candidates selected. Exiting.")
+        return
+
+    # Terminate selected candidates
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}[!] Quitting selected software...{Colors.RESET}")
+    needs_sudo_apps = []
+    for c in selected_candidates:
+        print(f"    - Quitting {Colors.BOLD}{c.display_name}{Colors.RESET} ({c.total_mb:.1f} MB across {len(c.pids)} procs)...", end="", flush=True)
+        if args.dry_run:
+            print(f" {Colors.CYAN}[DRY-RUN - SKIPPED]{Colors.RESET}")
+        else:
+            status, count = terminate_candidate(c, dry_run=args.dry_run)
+            if status == "needs_sudo":
+                print(f" {Colors.RED}[REQUIRES SUDO]{Colors.RESET}")
+                needs_sudo_apps.append(c.display_name)
+            else:
+                print(f" {Colors.GREEN}[DONE]{Colors.RESET}")
+
+    if not args.dry_run:
+        time.sleep(0.5)
+
+    # After-cleanup report
+    vm_after = psutil.virtual_memory()
+    after_used_gb = vm_after.used / (1024**3)
+    freed_gb = max(0.0, initial_used_gb - after_used_gb)
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'=' * 68}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}                      CLEANUP RESULTS                      {Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'=' * 68}{Colors.RESET}")
+    print(f"  {Colors.BOLD}RAM Before :{Colors.RESET} {render_ram_bar(vm_before.used, vm_before.total)}")
+    print(f"  {Colors.BOLD}RAM After  :{Colors.RESET} {render_ram_bar(vm_after.used, vm_after.total)}")
+    print(f"  {Colors.BOLD}RAM Freed  :{Colors.RESET} {Colors.GREEN}{freed_gb:.2f} GB ({freed_gb * 1024:.0f} MB){Colors.RESET}")
+    print(f"{Colors.CYAN}{'-' * 68}{Colors.RESET}")
+
+    if after_used_gb <= args.target:
+        print(f"\n{Colors.BOLD}{Colors.GREEN}✓ SUCCESS: Memory usage successfully brought down to {after_used_gb:.2f} GB (below {args.target:.2f} GB target)!{Colors.RESET}\n")
+    else:
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}ℹ Memory currently at {after_used_gb:.2f} GB.{Colors.RESET}")
+        print(f"  Target of {args.target:.2f} GB is {after_used_gb - args.target:.2f} GB away.")
+        
+        if needs_sudo_apps:
+            print(f"  {Colors.RED}* Note: {', '.join(needs_sudo_apps)} requires root.{Colors.RESET}")
+            print(f"  {Colors.YELLOW}  Run: sudo ~/.local/bin/ram-cleaner -y -c{Colors.RESET}")
+            print(f"  {Colors.DIM}  (Or install globally: sudo cp ~/.local/bin/ram-cleaner /usr/local/bin/){Colors.RESET}")
+
+        print(f"  {Colors.DIM}* Note: Antigravity IDE alone uses ~1.48 GB. While this IDE is open, the system baseline is ~3.0 GB.{Colors.RESET}")
+        print(f"  {Colors.DIM}* Once you close Antigravity IDE, your desktop RAM will drop straight to ~1.2 - 1.5 GB!{Colors.RESET}\n")
+
+if __name__ == "__main__":
+    main()
