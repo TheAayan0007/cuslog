@@ -2,7 +2,7 @@
 
 Exported utilities:
 - **`lockscreen-config`** (`lockscreen-config/`): KDE Plasma 6 Breeze lock screen, logout screen, and SDDM login customizer (`PyQt6`).
-- **`customize-dock`** (`customize-dock/`): KDE Plasma 6 bottom dock & top bar customizer (`PyQt6` GUI + CLI) plus the `Panel.qml` shell view override for independent top-bar styling.
+- **`customize-dock`** (`customize-dock/`): KDE Plasma 6 bottom dock & top bar customizer (`PyQt6` GUI + CLI), the `Panel.qml` shell view override for independent top-bar styling, and the `CompactApplet.qml` override that lets you triple-click the bottom Application Launcher (Kali logo) to toggle the bottom dock between **Dodge Windows** and **Auto Hide**.
 - **`ram-cleaner`** (`ram-cleaner/`): Memory & idle-process cleaner CLI (`psutil`).
 
 ## Install All Three
