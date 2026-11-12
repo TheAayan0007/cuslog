@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Lock Screen & Login Customizer
-Comment=Configure KDE Breeze lock screen and SDDM login screen fonts, positions, time, and animations
-Exec=/home/windows/.local/bin/lockscreen-config
-Icon=preferences-desktop-screensaver
-Terminal=false
-Type=Application
-Categories=Settings;DesktopSettings;Qt;KDE;
-StartupNotify=true
