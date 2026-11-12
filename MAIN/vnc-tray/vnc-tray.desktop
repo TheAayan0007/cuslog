@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=VNC 2nd Display
+GenericName=iPhone 2nd Screen VNC Server
+Comment=Use your iPhone as a 2nd display or mirror your Kali Linux screen via VNC
+Exec=vnc-tray
+Icon=vnc-tray
+Terminal=false
+Categories=Network;RemoteAccess;Utility;
+Keywords=vnc;krfb;monitor;display;second screen;iphone;ipad;extend;mirror;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

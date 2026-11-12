@@ -1,0 +1,1620 @@
+#!/usr/bin/env python3
+"""System tray toggle and GUI controller for VNC screen sharing & iPhone 2nd display."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
+
+CONFIG_DIR = Path.home() / ".config" / "vnc-tray"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+IPC_SERVER_NAME = f"vnc-tray-{os.getuid()}"
+APP_ICON_PATH = Path.home() / ".local/share/icons/hicolor/scalable/apps/vnc-tray.svg"
+
+SERVER_BACKENDS: list[tuple[str, str]] = [
+    ("remote_control", "Mouse & Keyboard Control (krfb — Screen Share / Virtual + Input)"),
+    ("virtual_monitor", "2nd Display Only (krfb-virtualmonitor — Auto Layout, View Only)"),
+]
+
+LAYOUT_CHOICES: list[tuple[str, str]] = [
+    ("right", "Extend Right (2nd Screen — Right of Laptop)"),
+    ("left", "Extend Left (2nd Screen — Left of Laptop)"),
+    ("above", "Extend Above (2nd Screen — Above Laptop)"),
+    ("below", "Extend Below (2nd Screen — Below Laptop)"),
+    ("mirror", "Mirror Laptop Screen (Same screen on iPhone)"),
+]
+
+RESOLUTION_PRESETS: list[tuple[str, int, int]] = [
+    ("1280 x 720 (HD Landscape — Smooth)", 1280, 720),
+    ("1920 x 1080 (Full HD Landscape)", 1920, 1080),
+    ("1600 x 900 (HD+ Landscape)", 1600, 900),
+    ("1170 x 844 (iPhone Wide Landscape)", 1170, 844),
+    ("844 x 1170 (iPhone Portrait)", 844, 1170),
+    ("1080 x 1920 (Full HD Portrait)", 1080, 1920),
+    ("1366 x 768 (Match Laptop 1366x768)", 1366, 768),
+    ("Custom Resolution...", 0, 0),
+]
+
+SCALE_CHOICES: list[float] = [1.0, 1.25, 1.5, 2.0]
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "server_backend": "remote_control",
+    "password": "kali1234",
+    "allow_unattended": True,
+    "port": 5900,
+    "display_name": "iPhoneDisplay",
+    "layout_mode": "right",
+    "width": 1280,
+    "height": 720,
+    "scale": 1.0,
+    "auto_start_service": False,
+}
+
+DARK_DIALOG_STYLE = """
+QDialog {
+    background-color: #111827;
+    color: #f3f4f6;
+}
+QLabel {
+    color: #e5e7eb;
+}
+QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {
+    background-color: #1f2937;
+    color: #f9fafb;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 6px 10px;
+    selection-background-color: #0284c7;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {
+    border: 1px solid #38bdf8;
+}
+QComboBox QAbstractItemView {
+    background-color: #1f2937;
+    color: #f9fafb;
+    selection-background-color: #0284c7;
+}
+QCheckBox {
+    color: #e5e7eb;
+    spacing: 8px;
+}
+QGroupBox {
+    border: 1px solid #374151;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: 600;
+    color: #93c5fd;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 6px;
+}
+QPushButton {
+    background-color: #1f2937;
+    color: #f3f4f6;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #374151;
+}
+QPushButton#primaryBtn {
+    background-color: #0284c7;
+    border-color: #0ea5e9;
+    color: #ffffff;
+}
+QPushButton#primaryBtn:hover {
+    background-color: #0ea5e9;
+}
+QPushButton#dangerBtn {
+    background-color: #7f1d1d;
+    border-color: #991b1b;
+    color: #fecaca;
+}
+QPushButton#dangerBtn:hover {
+    background-color: #991b1b;
+}
+"""
+
+
+def sanitize_display_name(raw: str) -> str:
+    """Return a clean virtual monitor identifier safe for KWin/CLI args."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw.strip())
+    return cleaned or DEFAULT_CONFIG["display_name"]
+
+
+def generate_password(length: int = 8) -> str:
+    """Generate an easy-to-type 8-character alphanumeric VNC password."""
+    alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def load_config() -> dict[str, Any]:
+    """Load persistent VNC display settings with safe defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    valid_backends = {b for b, _ in SERVER_BACKENDS}
+    backend = str(cfg.get("server_backend", "remote_control")).lower()
+    cfg["server_backend"] = backend if backend in valid_backends else "remote_control"
+
+    password = str(cfg.get("password", "")).strip()
+    cfg["password"] = password or DEFAULT_CONFIG["password"]
+    cfg["allow_unattended"] = bool(cfg.get("allow_unattended", True))
+    try:
+        port = int(cfg.get("port", 5900))
+    except (TypeError, ValueError):
+        port = 5900
+    cfg["port"] = max(5900, min(5999, port))
+    cfg["display_name"] = sanitize_display_name(str(cfg.get("display_name", "")))
+
+    valid_modes = {m for m, _ in LAYOUT_CHOICES}
+    mode = str(cfg.get("layout_mode", "right")).lower()
+    cfg["layout_mode"] = mode if mode in valid_modes else "right"
+
+    for dim, fallback in (("width", 1280), ("height", 720)):
+        try:
+            val = int(cfg.get(dim, fallback))
+        except (TypeError, ValueError):
+            val = fallback
+        cfg[dim] = max(320, min(3840, val))
+
+    try:
+        scale = float(cfg.get("scale", 1.0))
+    except (TypeError, ValueError):
+        scale = 1.0
+    cfg["scale"] = scale if scale in SCALE_CHOICES else 1.0
+    cfg["auto_start_service"] = bool(cfg.get("auto_start_service", False))
+    return cfg
+
+
+def obscure_krfb_password(password: str) -> str:
+    """Encode password with KDE's KStringHandler::obscure() for krfbrc."""
+    return "".join(chr(0x1001F - ord(ch)) if ord(ch) >= 0x22 else ch for ch in password)
+
+
+def sync_krfb_config(cfg: dict[str, Any]) -> bool:
+    """Write krfbrc settings so krfb enables mouse/keyboard control and VNC auth."""
+    kwrite = shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")
+    if not kwrite:
+        return False
+
+    port = int(cfg["port"])
+    pw = cfg["password"]
+    unattended = bool(cfg.get("allow_unattended", True))
+    # Keep normal vs unattended passwords distinct so unattended auth auto-accepts cleanly.
+    unattended_pw = obscure_krfb_password(pw) if unattended else ""
+    desktop_pw = obscure_krfb_password(generate_password(12) if unattended else pw)
+    fb_plugin = "pw" if is_wayland_session() else "xcb"
+
+    for stale_key in ("unattendedAccessPassword", "desktopSharingPassword"):
+        subprocess.run(
+            [kwrite, "--file", "krfbrc", "--group", "Security", "--key", stale_key, "--delete"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    entries = [
+        ("Security", "allowDesktopControl", "bool", "true"),
+        ("Security", "noWallet", "bool", "true"),
+        ("Security", "allowUnattendedAccess", "bool", "true" if unattended else "false"),
+        ("Security", "unattendedPassword", None, unattended_pw),
+        ("Security", "desktopPassword", None, desktop_pw),
+        ("FrameBuffer", "preferredFrameBufferPlugin", None, fb_plugin),
+        ("TCP", "useDefaultPort", "bool", "true" if port == 5900 else "false"),
+        ("TCP", "port", None, str(port)),
+        ("TCP", "publishService", "bool", "true"),
+        ("MainWindow", "startMinimized", "bool", "true"),
+    ]
+    for group, key, val_type, val in entries:
+        cmd = [kwrite, "--file", "krfbrc", "--group", group, "--key", key]
+        if val_type:
+            cmd.extend(["--type", val_type])
+        cmd.append(val)
+        res = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            return False
+    return True
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    """Persist configuration atomically to user config directory."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_file = CONFIG_FILE.with_suffix(".tmp")
+    tmp_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp_file, 0o600)
+    tmp_file.replace(CONFIG_FILE)
+
+
+def get_primary_ip() -> str:
+    """Best-effort lookup of the primary LAN IPv4 address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("1.1.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        ips = get_all_local_ips()
+        return ips[0][1] if ips else "127.0.0.1"
+
+
+def get_all_local_ips() -> list[tuple[str, str]]:
+    """Return list of (interface, ipv4) pairs for active non-loopback interfaces."""
+    results: list[tuple[str, str]] = []
+    if shutil.which("ip"):
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "inet":
+                    iface = parts[1]
+                    ip_addr = parts[3].split("/")[0]
+                    results.append((iface, ip_addr))
+        except subprocess.SubprocessError:
+            pass
+    return results
+
+
+def is_wayland_session() -> bool:
+    """Return True if the current desktop session is running on Wayland."""
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def get_kscreen_outputs() -> list[dict[str, Any]]:
+    """Query current displays from KDE kscreen-doctor JSON output."""
+    if not shutil.which("kscreen-doctor"):
+        return []
+    try:
+        res = subprocess.run(
+            ["kscreen-doctor", "-j"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return []
+        data = json.loads(res.stdout)
+        outputs = data.get("outputs", [])
+        return outputs if isinstance(outputs, list) else []
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
+def logical_size(output: dict[str, Any]) -> tuple[int, int]:
+    """Return logical (width, height) of a KScreen output accounting for scale."""
+    size = output.get("size") or {}
+    w = int(size.get("width", 1366) or 1366)
+    h = int(size.get("height", 768) or 768)
+    scale = float(output.get("scale", 1.0) or 1.0)
+    if scale > 0:
+        return max(1, int(round(w / scale))), max(1, int(round(h / scale)))
+    return w, h
+
+
+def find_external_krfb_pids() -> list[tuple[int, str]]:
+    """Return (pid, exe_name) pairs for running krfb or krfb-virtualmonitor processes."""
+    matches: list[tuple[int, str]] = []
+    my_pid = os.getpid()
+    proc_dir = Path("/proc")
+    try:
+        entries = list(proc_dir.iterdir())
+    except OSError:
+        return matches
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            cmdline_raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not cmdline_raw:
+            continue
+        first_arg = cmdline_raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+        exe_name = os.path.basename(first_arg)
+        if exe_name in ("krfb", "krfb-virtualmonitor"):
+            matches.append((pid, exe_name))
+    return matches
+
+
+def is_port_in_use(port: int) -> bool:
+    """Return True if a TCP listener is already bound on the given port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.25)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def backend_label(backend: str) -> str:
+    """Return short human-readable label for a server backend key."""
+    if backend == "remote_control":
+        return "Mouse & Keyboard ON"
+    return "2nd Display (View Only)"
+
+
+def layout_label(mode: str) -> str:
+    """Return human-readable label for a layout mode key."""
+    for key, label in LAYOUT_CHOICES:
+        if key == mode:
+            return label.split(" (")[0]
+    return mode.capitalize()
+
+
+def build_tray_icon(state: str) -> QtGui.QIcon:
+    """Render a crisp dual-display (laptop + iPhone) icon reflecting VNC server state."""
+    icon = QtGui.QIcon()
+    for size in (22, 32, 48, 64):
+        pixmap = QtGui.QPixmap(size, size)
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        scale = size / 64.0
+        painter.scale(scale, scale)
+
+        if state == "running":
+            laptop_color = QtGui.QColor("#e2e8f0")
+            phone_color = QtGui.QColor("#38bdf8")
+            badge_color = QtGui.QColor("#22c55e")
+        elif state == "starting":
+            laptop_color = QtGui.QColor("#e2e8f0")
+            phone_color = QtGui.QColor("#fbbf24")
+            badge_color = QtGui.QColor("#f59e0b")
+        elif state == "error":
+            laptop_color = QtGui.QColor("#fca5a5")
+            phone_color = QtGui.QColor("#ef4444")
+            badge_color = QtGui.QColor("#ef4444")
+        else:
+            laptop_color = QtGui.QColor("#cbd5e1")
+            phone_color = QtGui.QColor("#94a3b8")
+            badge_color = None
+
+        # Laptop monitor on the left
+        pen = QtGui.QPen(laptop_color, 4.2)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtGui.QColor("#0f172a"))
+        painter.drawRoundedRect(QtCore.QRectF(7.0, 14.0, 30.0, 23.0), 3.5, 3.5)
+        painter.drawLine(QtCore.QPointF(22.0, 37.0), QtCore.QPointF(22.0, 44.0))
+        painter.drawLine(QtCore.QPointF(14.0, 44.0), QtCore.QPointF(30.0, 44.0))
+
+        # iPhone 2nd screen on the right
+        phone_pen = QtGui.QPen(phone_color, 4.2)
+        phone_pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        phone_pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(phone_pen)
+        painter.setBrush(QtGui.QColor("#0f172a"))
+        painter.drawRoundedRect(QtCore.QRectF(36.0, 19.0, 21.0, 33.0), 4.5, 4.5)
+
+        # Tiny home bar inside phone screen
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(phone_color)
+        painter.drawRoundedRect(QtCore.QRectF(42.5, 46.0, 8.0, 2.2), 1.0, 1.0)
+
+        # Status dot in bottom-right corner
+        if badge_color is not None:
+            painter.setPen(QtGui.QPen(QtGui.QColor("#0f172a"), 2.4))
+            painter.setBrush(badge_color)
+            painter.drawEllipse(QtCore.QRectF(44.0, 42.0, 15.0, 15.0))
+
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    """GUI dialog to configure VNC mode, password, input auth, resolution, and port."""
+
+    def __init__(self, cfg: dict[str, Any], is_running: bool, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("VNC 2nd Display & Remote Control Settings")
+        self.setWindowIcon(build_tray_icon("running" if is_running else "stopped"))
+        self.setMinimumWidth(510)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(12)
+        root.setContentsMargins(18, 18, 18, 18)
+
+        title = QtWidgets.QLabel("iPhone VNC Display & Remote Control Settings")
+        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #f9fafb;")
+        root.addWidget(title)
+
+        # --- VNC Mode ---
+        mode_group = QtWidgets.QGroupBox("VNC Mode & Input Control")
+        mode_form = QtWidgets.QFormLayout(mode_group)
+        mode_form.setSpacing(8)
+
+        self.backend_combo = QtWidgets.QComboBox()
+        for key, label in SERVER_BACKENDS:
+            self.backend_combo.addItem(label, key)
+        b_idx = self.backend_combo.findData(cfg["server_backend"])
+        if b_idx >= 0:
+            self.backend_combo.setCurrentIndex(b_idx)
+        self.backend_combo.currentIndexChanged.connect(self._sync_backend_ui)
+        mode_form.addRow("Server Mode:", self.backend_combo)
+
+        self.mode_hint = QtWidgets.QLabel()
+        self.mode_hint.setWordWrap(True)
+        self.mode_hint.setStyleSheet("color: #93c5fd; font-size: 11px;")
+        mode_form.addRow("", self.mode_hint)
+        root.addWidget(mode_group)
+
+        # --- Security / Password ---
+        sec_group = QtWidgets.QGroupBox("VNC Authentication & Network")
+        sec_form = QtWidgets.QFormLayout(sec_group)
+        sec_form.setSpacing(10)
+
+        pw_row = QtWidgets.QHBoxLayout()
+        self.pw_edit = QtWidgets.QLineEdit(cfg["password"])
+        self.pw_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.pw_edit.setPlaceholderText("Enter VNC password")
+        pw_row.addWidget(self.pw_edit, 1)
+
+        self.show_pw_btn = QtWidgets.QPushButton("Show")
+        self.show_pw_btn.setCheckable(True)
+        self.show_pw_btn.toggled.connect(self._toggle_pw_visibility)
+        pw_row.addWidget(self.show_pw_btn)
+
+        gen_pw_btn = QtWidgets.QPushButton("Random")
+        gen_pw_btn.clicked.connect(self._generate_pw)
+        pw_row.addWidget(gen_pw_btn)
+        sec_form.addRow("VNC Password:", pw_row)
+
+        self.pw_hint = QtWidgets.QLabel(
+            "Tip: Keep password <= 8 characters for maximum compatibility with all iPhone VNC apps."
+        )
+        self.pw_hint.setWordWrap(True)
+        self.pw_hint.setStyleSheet("color: #9ca3af; font-size: 11px;")
+        sec_form.addRow("", self.pw_hint)
+
+        self.unattended_cb = QtWidgets.QCheckBox(
+            "Authenticate on iPhone with password directly (skip extra Accept popup on Kali)"
+        )
+        self.unattended_cb.setChecked(bool(cfg.get("allow_unattended", True)))
+        sec_form.addRow("", self.unattended_cb)
+
+        net_row = QtWidgets.QHBoxLayout()
+        self.port_spin = QtWidgets.QSpinBox()
+        self.port_spin.setRange(5900, 5999)
+        self.port_spin.setValue(int(cfg["port"]))
+        net_row.addWidget(self.port_spin)
+
+        net_row.addWidget(QtWidgets.QLabel("Monitor Name:"))
+        self.name_edit = QtWidgets.QLineEdit(cfg["display_name"])
+        self.name_edit.setPlaceholderText("iPhoneDisplay")
+        net_row.addWidget(self.name_edit, 1)
+        sec_form.addRow("VNC Port:", net_row)
+
+        root.addWidget(sec_group)
+
+        # --- Display & Layout (for Virtual Monitor mode) ---
+        self.disp_group = QtWidgets.QGroupBox("2nd Display Resolution & Position (View-Only Mode)")
+        disp_form = QtWidgets.QFormLayout(self.disp_group)
+        disp_form.setSpacing(10)
+
+        self.layout_combo = QtWidgets.QComboBox()
+        for key, label in LAYOUT_CHOICES:
+            self.layout_combo.addItem(label, key)
+        idx = self.layout_combo.findData(cfg["layout_mode"])
+        if idx >= 0:
+            self.layout_combo.setCurrentIndex(idx)
+        disp_form.addRow("Screen Mode:", self.layout_combo)
+
+        self.preset_combo = QtWidgets.QComboBox()
+        matched_idx = len(RESOLUTION_PRESETS) - 1
+        for i, (label, pw, ph) in enumerate(RESOLUTION_PRESETS):
+            self.preset_combo.addItem(label, (pw, ph))
+            if pw == cfg["width"] and ph == cfg["height"]:
+                matched_idx = i
+        self.preset_combo.setCurrentIndex(matched_idx)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        disp_form.addRow("Resolution Preset:", self.preset_combo)
+
+        res_row = QtWidgets.QHBoxLayout()
+        self.width_spin = QtWidgets.QSpinBox()
+        self.width_spin.setRange(320, 3840)
+        self.width_spin.setValue(int(cfg["width"]))
+        self.height_spin = QtWidgets.QSpinBox()
+        self.height_spin.setRange(320, 3840)
+        self.height_spin.setValue(int(cfg["height"]))
+        res_row.addWidget(self.width_spin)
+        res_row.addWidget(QtWidgets.QLabel("x"))
+        res_row.addWidget(self.height_spin)
+        res_row.addStretch()
+        disp_form.addRow("Custom Size (W x H):", res_row)
+
+        self.scale_combo = QtWidgets.QComboBox()
+        for sc in SCALE_CHOICES:
+            self.scale_combo.addItem(f"{sc:g}x (UI Scale)", sc)
+        sc_idx = self.scale_combo.findData(float(cfg["scale"]))
+        if sc_idx >= 0:
+            self.scale_combo.setCurrentIndex(sc_idx)
+        disp_form.addRow("Display Scale (DPR):", self.scale_combo)
+
+        self.width_spin.valueChanged.connect(self._sync_custom_preset)
+        self.height_spin.valueChanged.connect(self._sync_custom_preset)
+        root.addWidget(self.disp_group)
+
+        # --- Behavior ---
+        self.autostart_cb = QtWidgets.QCheckBox(
+            "Auto-start VNC server when top-bar tray icon opens at login"
+        )
+        self.autostart_cb.setChecked(bool(cfg.get("auto_start_service", False)))
+        root.addWidget(self.autostart_cb)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        save_btn = QtWidgets.QPushButton(
+            "Save & Restart VNC" if is_running else "Save Settings"
+        )
+        save_btn.setObjectName("primaryBtn")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_accept)
+        btn_row.addWidget(save_btn)
+        root.addLayout(btn_row)
+
+        self._sync_backend_ui()
+
+    def _sync_backend_ui(self) -> None:
+        is_remote = self.backend_combo.currentData() == "remote_control"
+        self.unattended_cb.setEnabled(is_remote)
+        self.name_edit.setEnabled(not is_remote)
+        self.disp_group.setEnabled(not is_remote)
+        if is_remote:
+            self.mode_hint.setText(
+                "Uses krfb + Wayland RemoteDesktop portal: when starting, click Share on KDE's popup "
+                "to pick your screen (or Virtual Output) & allow cursor/keyboard, then enter your VNC password on iPhone."
+            )
+        else:
+            self.mode_hint.setText(
+                "Uses krfb-virtualmonitor: creates an instant 2nd screen with auto layout (no popup, view-only from iPhone)."
+            )
+
+    def _toggle_pw_visibility(self, checked: bool) -> None:
+        self.pw_edit.setEchoMode(
+            QtWidgets.QLineEdit.EchoMode.Normal
+            if checked
+            else QtWidgets.QLineEdit.EchoMode.Password
+        )
+        self.show_pw_btn.setText("Hide" if checked else "Show")
+
+    def _generate_pw(self) -> None:
+        self.pw_edit.setText(generate_password(8))
+        self.show_pw_btn.setChecked(True)
+
+    def _on_preset_changed(self, idx: int) -> None:
+        data = self.preset_combo.itemData(idx)
+        if not data:
+            return
+        w, h = data
+        if w > 0 and h > 0:
+            self.width_spin.blockSignals(True)
+            self.height_spin.blockSignals(True)
+            self.width_spin.setValue(w)
+            self.height_spin.setValue(h)
+            self.width_spin.blockSignals(False)
+            self.height_spin.blockSignals(False)
+
+    def _sync_custom_preset(self) -> None:
+        w = self.width_spin.value()
+        h = self.height_spin.value()
+        for i, (_, pw, ph) in enumerate(RESOLUTION_PRESETS):
+            if pw == w and ph == h:
+                self.preset_combo.blockSignals(True)
+                self.preset_combo.setCurrentIndex(i)
+                self.preset_combo.blockSignals(False)
+                return
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(len(RESOLUTION_PRESETS) - 1)
+        self.preset_combo.blockSignals(False)
+
+    def _on_accept(self) -> None:
+        if not self.pw_edit.text().strip():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Password Required",
+                "VNC password cannot be empty.",
+            )
+            self.pw_edit.setFocus()
+            return
+        self.accept()
+
+    def result_config(self) -> dict[str, Any]:
+        """Return validated configuration dictionary from the dialog inputs."""
+        return {
+            "server_backend": str(self.backend_combo.currentData() or "remote_control"),
+            "password": self.pw_edit.text().strip(),
+            "allow_unattended": self.unattended_cb.isChecked(),
+            "port": self.port_spin.value(),
+            "display_name": sanitize_display_name(self.name_edit.text()),
+            "layout_mode": str(self.layout_combo.currentData() or "right"),
+            "width": self.width_spin.value(),
+            "height": self.height_spin.value(),
+            "scale": float(self.scale_combo.currentData() or 1.0),
+            "auto_start_service": self.autostart_cb.isChecked(),
+        }
+
+
+class ConnectionInfoDialog(QtWidgets.QDialog):
+    """Dialog showing iPhone connection address, password copy tools, and setup guide."""
+
+    def __init__(self, controller: "VncTrayApp", parent=None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("Connect iPhone as 2nd Display — VNC Guide")
+        self.setWindowIcon(build_tray_icon(controller.state))
+        self.setMinimumWidth(480)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        self.header_label = QtWidgets.QLabel()
+        self.header_label.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(self.header_label)
+
+        info_box = QtWidgets.QGroupBox("Connection Details (Enter on iPhone)")
+        form = QtWidgets.QFormLayout(info_box)
+        form.setSpacing(10)
+
+        addr_row = QtWidgets.QHBoxLayout()
+        self.addr_edit = QtWidgets.QLineEdit()
+        self.addr_edit.setReadOnly(True)
+        addr_row.addWidget(self.addr_edit, 1)
+        copy_addr = QtWidgets.QPushButton("Copy IP:Port")
+        copy_addr.clicked.connect(lambda: self._copy_text(self.addr_edit.text(), "IP:Port"))
+        addr_row.addWidget(copy_addr)
+        form.addRow("Server Address:", addr_row)
+
+        pw_row = QtWidgets.QHBoxLayout()
+        self.pw_view = QtWidgets.QLineEdit()
+        self.pw_view.setReadOnly(True)
+        self.pw_view.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        pw_row.addWidget(self.pw_view, 1)
+        self.reveal_btn = QtWidgets.QPushButton("Show")
+        self.reveal_btn.setCheckable(True)
+        self.reveal_btn.toggled.connect(self._toggle_pw)
+        pw_row.addWidget(self.reveal_btn)
+        copy_pw = QtWidgets.QPushButton("Copy")
+        copy_pw.clicked.connect(lambda: self._copy_text(self.pw_view.text(), "Password"))
+        pw_row.addWidget(copy_pw)
+        form.addRow("VNC Password:", pw_row)
+
+        self.all_ips_label = QtWidgets.QLabel()
+        self.all_ips_label.setWordWrap(True)
+        self.all_ips_label.setStyleSheet("color: #93c5fd; font-size: 12px;")
+        form.addRow("All Local IPs:", self.all_ips_label)
+        layout.addWidget(info_box)
+
+        self.guide = QtWidgets.QLabel()
+        self.guide.setWordWrap(True)
+        self.guide.setStyleSheet(
+            "background-color: #0f172a; border: 1px solid #334155; "
+            "border-radius: 8px; padding: 12px; color: #cbd5e1; line-height: 1.45;"
+        )
+        layout.addWidget(self.guide)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.toggle_btn = QtWidgets.QPushButton()
+        self.toggle_btn.setObjectName("primaryBtn")
+        self.toggle_btn.clicked.connect(controller.toggle_service)
+        btn_row.addWidget(self.toggle_btn)
+
+        settings_btn = QtWidgets.QPushButton("Change Password / Settings...")
+        settings_btn.clicked.connect(controller.open_settings)
+        btn_row.addWidget(settings_btn)
+
+        btn_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self.refresh()
+
+    def _toggle_pw(self, checked: bool) -> None:
+        self.pw_view.setEchoMode(
+            QtWidgets.QLineEdit.EchoMode.Normal
+            if checked
+            else QtWidgets.QLineEdit.EchoMode.Password
+        )
+        self.reveal_btn.setText("Hide" if checked else "Show")
+
+    def _copy_text(self, value: str, label: str) -> None:
+        QtWidgets.QApplication.clipboard().setText(value)
+        self.controller.tray.showMessage(
+            "Copied",
+            f"{label} copied to clipboard.",
+            QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+            1800,
+        )
+
+    def refresh(self) -> None:
+        cfg = self.controller.config
+        ip = get_primary_ip()
+        port = cfg["port"]
+        active = self.controller.is_active()
+        is_remote = cfg["server_backend"] == "remote_control"
+        mode_text = (
+            "Mouse & Keyboard Control"
+            if is_remote
+            else f"{layout_label(cfg['layout_mode'])} (View Only)"
+        )
+        if self.controller.state == "running":
+            self.header_label.setText(f"● VNC Active ({mode_text})")
+            self.header_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #4ade80;")
+        elif self.controller.state == "starting":
+            self.header_label.setText("◐ Starting VNC (Approve KDE popup if shown)...")
+            self.header_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #fbbf24;")
+        else:
+            self.header_label.setText(f"○ VNC Server Stopped ({mode_text})")
+            self.header_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #cbd5e1;")
+
+        self.addr_edit.setText(f"{ip}:{port}")
+        self.pw_view.setText(cfg["password"])
+        all_ips = get_all_local_ips()
+        if all_ips:
+            formatted = "   •   ".join(f"{iface}: {addr}:{port}" for iface, addr in all_ips)
+        else:
+            formatted = f"{ip}:{port}"
+        self.all_ips_label.setText(formatted)
+        self.toggle_btn.setText("Stop VNC Server" if active else "Start VNC Server")
+
+        if is_remote:
+            self.guide.setText(
+                "<b>How to control Kali from your iPhone (Mouse &amp; Keyboard ON):</b><br>"
+                "1. Connect iPhone &amp; Kali to the <b>same Wi-Fi</b> (or iPhone Hotspot / USB tethering).<br>"
+                "2. Click <b>Start VNC Server</b>: when KDE's permission dialog pops up on Kali, pick your screen (or <i>Virtual Output</i>), keep Remote Control allowed, and click <b>Share</b>.<br>"
+                "3. On your iPhone, open <b>RealVNC Viewer</b> (or TigerVNC/RVNC), connect to the <b>Server Address</b> above, and authenticate with your <b>VNC Password</b>.<br>"
+                "4. Your iPhone touchscreen &amp; keyboard now control Kali's cursor and keys! (Make sure View-Only is OFF in the iPhone app.)"
+            )
+        else:
+            self.guide.setText(
+                "<b>How to use your iPhone as a 2nd Display (View-Only Mode):</b><br>"
+                "1. Connect iPhone &amp; Kali to the <b>same Wi-Fi</b> (or iPhone Hotspot / USB tethering).<br>"
+                "2. On your iPhone, open <b>RealVNC Viewer</b> (or TigerVNC/RVNC), connect to the <b>Server Address</b> above, and enter your <b>VNC Password</b>.<br>"
+                "3. Drag windows off the edge of your laptop screen onto your iPhone! (Switch to <i>Mouse &amp; Keyboard Control</i> mode in the tray menu if you want to control Kali from iPhone.)"
+            )
+
+
+class LogViewerDialog(QtWidgets.QDialog):
+    """Non-blocking status & live log viewer window."""
+
+    def __init__(self, controller: "VncTrayApp", parent=None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("VNC 2nd Display Status & Logs")
+        self.setWindowIcon(build_tray_icon(controller.state))
+        self.resize(650, 400)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setStyleSheet("font-weight: 600; font-size: 13px;")
+        layout.addWidget(self.status_label)
+
+        self.log_box = QtWidgets.QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFont(QtGui.QFont("monospace", 9))
+        layout.addWidget(self.log_box)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.toggle_btn = QtWidgets.QPushButton()
+        self.toggle_btn.setObjectName("primaryBtn")
+        self.toggle_btn.clicked.connect(controller.toggle_service)
+        btn_row.addWidget(self.toggle_btn)
+
+        info_btn = QtWidgets.QPushButton("iPhone Info...")
+        info_btn.clicked.connect(controller.open_connection_info)
+        btn_row.addWidget(info_btn)
+
+        settings_btn = QtWidgets.QPushButton("Settings...")
+        settings_btn.clicked.connect(controller.open_settings)
+        btn_row.addWidget(settings_btn)
+
+        reapply_btn = QtWidgets.QPushButton("Re-apply Layout")
+        reapply_btn.clicked.connect(controller.apply_virtual_layout)
+        btn_row.addWidget(reapply_btn)
+
+        clear_btn = QtWidgets.QPushButton("Clear Logs")
+        clear_btn.clicked.connect(self._clear_logs)
+        btn_row.addWidget(clear_btn)
+
+        btn_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self.refresh()
+
+    def _clear_logs(self) -> None:
+        self.controller.log_lines.clear()
+        self.log_box.clear()
+
+    def append_line(self, line: str) -> None:
+        self.log_box.appendPlainText(line)
+
+    def refresh(self) -> None:
+        cfg = self.controller.config
+        ip = get_primary_ip()
+        state_text = self.controller.state.capitalize()
+        backend = backend_label(cfg["server_backend"])
+        if cfg["server_backend"] == "remote_control":
+            detail = "krfb (Wayland RemoteDesktop)"
+        else:
+            virt = self.controller.virtual_output_name or "not created"
+            detail = f"{layout_label(cfg['layout_mode'])} {cfg['width']}x{cfg['height']} ({virt})"
+        self.status_label.setText(
+            f"State: {state_text}   |   {ip}:{cfg['port']}   |   {backend}   |   {detail}"
+        )
+        self.toggle_btn.setText(
+            "Stop VNC Server" if self.controller.is_active() else "Start VNC Server"
+        )
+        self.log_box.setPlainText("\n".join(self.controller.log_lines))
+        scrollbar = self.log_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+
+class VncTrayApp(QtCore.QObject):
+    """Main controller managing the top-bar tray icon, VNC server modes, and layout."""
+
+    def __init__(self, app: QtWidgets.QApplication) -> None:
+        super().__init__()
+        self.app = app
+        self.config = load_config()
+        self.state = "stopped"
+        self.log_lines: list[str] = []
+        self.virtual_output_name: str | None = None
+        self._active_backend: str | None = None
+        self._outputs_before_start: set[str] = set()
+        self._layout_poll_tries = 0
+        self._startup_poll_tries = 0
+        self._pending_restart = False
+        self._manual_stop = False
+        self._log_dialog: LogViewerDialog | None = None
+        self._info_dialog: ConnectionInfoDialog | None = None
+        self._settings_dialog: SettingsDialog | None = None
+
+        self.process = QtCore.QProcess(self)
+        self.process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._on_process_output)
+        self.process.finished.connect(self._on_process_finished)
+        self.process.errorOccurred.connect(self._on_process_error)
+
+        self._layout_timer = QtCore.QTimer(self)
+        self._layout_timer.setInterval(350)
+        self._layout_timer.timeout.connect(self._poll_and_apply_layout)
+
+        self._startup_poll_timer = QtCore.QTimer(self)
+        self._startup_poll_timer.setInterval(400)
+        self._startup_poll_timer.timeout.connect(self._poll_server_listening)
+
+        self.tray = QtWidgets.QSystemTrayIcon(self)
+        self.tray.activated.connect(self._on_tray_activated)
+
+        self._build_menu()
+        self._sync_ui()
+        self.tray.show()
+
+        self._setup_ipc_server()
+
+        if self.config.get("auto_start_service", False):
+            QtCore.QTimer.singleShot(500, self.start_service)
+
+    def _setup_ipc_server(self) -> None:
+        QtNetwork.QLocalServer.removeServer(IPC_SERVER_NAME)
+        self.ipc_server = QtNetwork.QLocalServer(self)
+        self.ipc_server.listen(IPC_SERVER_NAME)
+        self.ipc_server.newConnection.connect(self._on_ipc_connection)
+
+    def _on_ipc_connection(self) -> None:
+        conn = self.ipc_server.nextPendingConnection()
+        if not conn:
+            return
+        conn.readyRead.connect(lambda: self._handle_ipc_message(conn))
+
+    def _handle_ipc_message(self, conn: QtNetwork.QLocalSocket) -> None:
+        msg = bytes(conn.readAll()).decode("utf-8", errors="ignore").strip()
+        conn.close()
+        if msg == "TOGGLE":
+            self.toggle_service()
+        else:
+            self.open_settings()
+
+    def _build_menu(self) -> None:
+        self.menu = QtWidgets.QMenu()
+
+        self.status_action = self.menu.addAction("")
+        self.status_action.setEnabled(False)
+        self.menu.addSeparator()
+
+        self.toggle_action = self.menu.addAction("Start VNC Server")
+        self.toggle_action.triggered.connect(self.toggle_service)
+
+        self.info_action = self.menu.addAction("iPhone Connection Info...")
+        self.info_action.triggered.connect(self.open_connection_info)
+
+        self.settings_action = self.menu.addAction("Settings & Password...")
+        self.settings_action.triggered.connect(self.open_settings)
+
+        self.backend_menu = self.menu.addMenu("Control Mode")
+        self.backend_group = QtGui.QActionGroup(self)
+        self.backend_group.setExclusive(True)
+        self.backend_actions: dict[str, QtGui.QAction] = {}
+        for key, label in SERVER_BACKENDS:
+            act = self.backend_menu.addAction(label.split(" (")[0])
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked, b=key: self.set_server_backend(b))
+            self.backend_group.addAction(act)
+            self.backend_actions[key] = act
+
+        self.layout_menu = self.menu.addMenu("2nd Screen Layout")
+        self.layout_group = QtGui.QActionGroup(self)
+        self.layout_group.setExclusive(True)
+        self.layout_actions: dict[str, QtGui.QAction] = {}
+        for mode_key, mode_label in LAYOUT_CHOICES:
+            act = self.layout_menu.addAction(mode_label.split(" (")[0])
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked, m=mode_key: self.set_layout_mode(m))
+            self.layout_group.addAction(act)
+            self.layout_actions[mode_key] = act
+
+        self.logs_action = self.menu.addAction("View Status / Logs...")
+        self.logs_action.triggered.connect(self.open_logs)
+
+        self.viewer_action = self.menu.addAction("Test Locally (VNC Viewer)")
+        self.viewer_action.triggered.connect(self.launch_local_viewer)
+
+        self.menu.addSeparator()
+
+        self.quit_action = self.menu.addAction("Close / Quit Tray")
+        self.quit_action.triggered.connect(self.quit_app)
+
+        self.tray.setContextMenu(self.menu)
+
+    def is_active(self) -> bool:
+        """Return True if the VNC server process is starting or running."""
+        return self.process.state() != QtCore.QProcess.ProcessState.NotRunning
+
+    def _sync_ui(self) -> None:
+        ip = get_primary_ip()
+        port = self.config["port"]
+        backend = self.config["server_backend"]
+        b_label = backend_label(backend)
+        mode = self.config["layout_mode"]
+        mode_short = layout_label(mode)
+        self.tray.setIcon(build_tray_icon(self.state))
+
+        if backend in self.backend_actions:
+            self.backend_actions[backend].setChecked(True)
+        if mode in self.layout_actions:
+            self.layout_actions[mode].setChecked(True)
+        self.layout_menu.setEnabled(backend == "virtual_monitor")
+
+        if self.state == "running":
+            self.status_action.setText(f"● Active: {ip}:{port} ({b_label})")
+            self.toggle_action.setText("Stop VNC Server")
+            self.tray.setToolTip(
+                f"VNC Server: ON ({ip}:{port})\n"
+                f"Mode: {b_label}\n"
+                "Left-click to stop • Right-click for info & settings"
+            )
+        elif self.state == "starting":
+            hint = "Approve KDE popup..." if backend == "remote_control" else f"port {port}..."
+            self.status_action.setText(f"◐ Starting VNC ({hint})")
+            self.toggle_action.setText("Stop VNC Server")
+            self.tray.setToolTip(f"VNC Server: Starting on {ip}:{port} ({hint})")
+        elif self.state == "error":
+            self.status_action.setText(f"! Error starting VNC (port {port})")
+            self.toggle_action.setText("Start VNC Server")
+            self.tray.setToolTip(
+                "VNC Server: Error\nLeft-click to retry • Right-click for logs"
+            )
+        else:
+            detail = b_label if backend == "remote_control" else mode_short
+            self.status_action.setText(f"○ Stopped — {detail} (Port {port})")
+            self.toggle_action.setText("Start VNC Server")
+            self.tray.setToolTip(
+                f"VNC Server: OFF ({ip}:{port}) • {b_label}\n"
+                "Left-click to start • Right-click for password & mode"
+            )
+
+        if self._log_dialog is not None and self._log_dialog.isVisible():
+            self._log_dialog.refresh()
+        if self._info_dialog is not None and self._info_dialog.isVisible():
+            self._info_dialog.refresh()
+
+    def _append_log(self, line: str) -> None:
+        self.log_lines.append(line)
+        if len(self.log_lines) > 400:
+            self.log_lines = self.log_lines[-400:]
+        if self._log_dialog is not None and self._log_dialog.isVisible():
+            self._log_dialog.append_line(line)
+
+    def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QtWidgets.QSystemTrayIcon.ActivationReason.Trigger,
+            QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.toggle_service()
+        elif reason == QtWidgets.QSystemTrayIcon.ActivationReason.MiddleClick:
+            self.open_settings()
+
+    def toggle_service(self) -> None:
+        """Start VNC 2nd Display if stopped, or stop it if running."""
+        if self.is_active():
+            self.stop_service()
+        else:
+            self.start_service()
+
+    def _handle_external_krfb(self) -> bool:
+        """Detect pre-existing krfb or krfb-virtualmonitor processes and offer to stop them."""
+        found = find_external_krfb_pids()
+        if not found:
+            return True
+        summary = ", ".join(f"{name} ({pid})" for pid, name in found)
+        reply = QtWidgets.QMessageBox.question(
+            None,
+            "Existing VNC Server Process Found",
+            f"Another VNC process is already running: {summary}.\n\n"
+            "Stop the existing instance so VNC 2nd Display can manage it cleanly?",
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return False
+        for pid, _ in found:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        QtCore.QThread.msleep(450)
+        return True
+
+    def start_service(self) -> None:
+        """Start VNC server (krfb with mouse/keyboard control or krfb-virtualmonitor)."""
+        if self.is_active():
+            return
+
+        backend = self.config["server_backend"]
+        if backend == "virtual_monitor" and not is_wayland_session():
+            QtWidgets.QMessageBox.warning(
+                None,
+                "Wayland Required for Virtual 2nd Screen",
+                "Virtual 2nd Display requires a KDE Plasma Wayland session.\n"
+                "Switch Control Mode to 'Mouse & Keyboard Control (krfb)' on X11.",
+            )
+            return
+
+        exe = "krfb" if backend == "remote_control" else "krfb-virtualmonitor"
+        if not shutil.which(exe):
+            QtWidgets.QMessageBox.critical(
+                None,
+                f"{exe} Not Found",
+                "The 'krfb' package is not installed yet.\n\n"
+                "Run the installer to set it up automatically:\n"
+                "python3 ~/Desktop/utils/MAIN/installer.py --only vnc-tray",
+            )
+            return
+
+        if not self._handle_external_krfb():
+            return
+
+        port = int(self.config["port"])
+        if is_port_in_use(port):
+            QtWidgets.QMessageBox.warning(
+                None,
+                "Port Already in Use",
+                f"TCP port {port} is already in use by another program.\n"
+                "Choose a different port (e.g. 5901) in Settings.",
+            )
+            self.open_settings()
+            return
+
+        self._active_backend = backend
+        self.virtual_output_name = None
+        self._manual_stop = False
+        self.state = "starting"
+
+        if backend == "remote_control":
+            if not sync_krfb_config(self.config):
+                self._append_log(">>> Warning: kwriteconfig6 failed; krfb may use existing ~/.config/krfbrc")
+            args = ["--nodialog"]
+            self._append_log(">>> Starting: krfb --nodialog (mouse & keyboard enabled via RemoteDesktop portal)")
+            if is_wayland_session():
+                self.tray.showMessage(
+                    "Approve Remote Control on Kali",
+                    "Pick your screen (or Virtual Output) & click Share in KDE's popup.",
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                    4500,
+                )
+        else:
+            self._outputs_before_start = {
+                o.get("name", "") for o in get_kscreen_outputs() if o.get("name")
+            }
+            res_str = f"{self.config['width']}x{self.config['height']}"
+            args = [
+                "--resolution",
+                res_str,
+                "--name",
+                self.config["display_name"],
+                "--password",
+                self.config["password"],
+                "--port",
+                str(port),
+                "--scale",
+                f"{self.config['scale']:g}",
+            ]
+            safe_args = [
+                "***" if i > 0 and args[i - 1] == "--password" else a
+                for i, a in enumerate(args)
+            ]
+            self._append_log(f">>> Starting: krfb-virtualmonitor {' '.join(safe_args)}")
+
+        self._sync_ui()
+        self.process.start(exe, args)
+        self._startup_poll_tries = 0
+        self._startup_poll_timer.start()
+
+    def stop_service(self, for_restart: bool = False) -> None:
+        """Gracefully terminate the managed VNC server process."""
+        self._layout_timer.stop()
+        self._startup_poll_timer.stop()
+        self._pending_restart = for_restart
+        if not self.is_active():
+            self.state = "stopped"
+            self.virtual_output_name = None
+            self._active_backend = None
+            self._sync_ui()
+            if for_restart:
+                self._pending_restart = False
+                QtCore.QTimer.singleShot(250, self.start_service)
+            return
+
+        self._manual_stop = True
+        exe = "krfb" if self._active_backend == "remote_control" else "krfb-virtualmonitor"
+        self._append_log(f">>> Stopping {exe}...")
+        self.process.terminate()
+        QtCore.QTimer.singleShot(2500, self._force_kill_if_stuck)
+
+    def _force_kill_if_stuck(self) -> None:
+        if self._manual_stop and self.is_active():
+            self._append_log(">>> Force killing unresponsive VNC process...")
+            self.process.kill()
+
+    def _poll_server_listening(self) -> None:
+        if not self.is_active() or self.state != "starting":
+            self._startup_poll_timer.stop()
+            return
+        self._startup_poll_tries += 1
+        if is_port_in_use(int(self.config["port"])):
+            self._startup_poll_timer.stop()
+            self._confirm_started()
+            return
+        if self._startup_poll_tries >= 240:
+            self._startup_poll_timer.stop()
+            self._append_log(">>> Timed out waiting for VNC listen port.")
+
+    def _on_process_output(self) -> None:
+        raw = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        error_markers = (
+            "Failed to start server",
+            "unable to load plugin",
+            "Couldn't initialize XDP-KDE",
+            "Couldn't select sources",
+            "Couldn't select devices",
+            "No devices were granted",
+            "Failed to start screencast",
+        )
+        for line in raw.splitlines():
+            clean = line.rstrip()
+            if not clean:
+                continue
+            self._append_log(clean)
+
+            if "Starting server. Listen port:" in clean and self.state == "starting":
+                self._startup_poll_timer.stop()
+                QtCore.QTimer.singleShot(200, self._confirm_started)
+            elif any(marker in clean for marker in error_markers):
+                self._startup_poll_timer.stop()
+                self.state = "error"
+                self._sync_ui()
+                self.tray.showMessage(
+                    "VNC Server Error",
+                    clean,
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Critical,
+                    5000,
+                )
+
+    def _confirm_started(self) -> None:
+        if self.is_active() and self.state == "starting":
+            self._startup_poll_timer.stop()
+            self.state = "running"
+            self._sync_ui()
+            if self._active_backend == "virtual_monitor":
+                self._layout_poll_tries = 0
+                self._layout_timer.start()
+            ip = get_primary_ip()
+            port = self.config["port"]
+            ctrl_note = (
+                " (Mouse & Keyboard ON)"
+                if self._active_backend == "remote_control"
+                else " (2nd Display)"
+            )
+            self.tray.showMessage(
+                f"VNC Ready{ctrl_note}",
+                f"Connect iPhone VNC Viewer to {ip}:{port}",
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+
+    def _detect_virtual_output(self, outputs: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Find the virtual monitor output created by krfb-virtualmonitor."""
+        target_name = self.config["display_name"]
+        for out in outputs:
+            name = str(out.get("name", ""))
+            if name == target_name or (name and name not in self._outputs_before_start):
+                return out
+        for out in outputs:
+            name = str(out.get("name", ""))
+            if name.startswith("Virtual") or target_name.lower() in name.lower():
+                return out
+        return None
+
+    def _pick_primary_output(
+        self, outputs: list[dict[str, Any]], virtual_name: str
+    ) -> dict[str, Any] | None:
+        """Pick the main physical laptop/desktop output (lowest priority or first non-virtual)."""
+        candidates = [
+            o for o in outputs if o.get("name") != virtual_name and o.get("enabled", True)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda o: int(o.get("priority", 99) or 99))
+        return candidates[0]
+
+    def _poll_and_apply_layout(self) -> None:
+        self._layout_poll_tries += 1
+        outputs = get_kscreen_outputs()
+        virt = self._detect_virtual_output(outputs)
+        if virt is not None:
+            self._layout_timer.stop()
+            self.virtual_output_name = str(virt.get("name"))
+            self._append_log(f">>> Detected virtual display output: {self.virtual_output_name}")
+            self.apply_virtual_layout()
+            self._sync_ui()
+            return
+        if self._layout_poll_tries >= 18:
+            self._layout_timer.stop()
+            self._append_log(">>> Virtual output not listed by kscreen-doctor yet; use Re-apply Layout if needed.")
+
+    def apply_virtual_layout(self) -> None:
+        """Position or mirror the virtual display relative to the primary laptop screen."""
+        if not shutil.which("kscreen-doctor"):
+            return
+        outputs = get_kscreen_outputs()
+        virt = self._detect_virtual_output(outputs)
+        if virt is None:
+            return
+        virt_name = str(virt["name"])
+        self.virtual_output_name = virt_name
+        primary = self._pick_primary_output(outputs, virt_name)
+        if primary is None:
+            return
+
+        prim_name = str(primary["name"])
+        prim_w, prim_h = logical_size(primary)
+        virt_w, virt_h = logical_size(virt)
+        mode = self.config["layout_mode"]
+
+        cmd = ["kscreen-doctor", f"output.{prim_name}.enable", f"output.{virt_name}.enable"]
+        if mode == "mirror":
+            cmd.append(f"output.{virt_name}.mirror.{prim_name}")
+        else:
+            if int(virt.get("replicationSource", 0) or 0) != 0:
+                cmd.append(f"output.{virt_name}.mirror.none")
+            if mode == "right":
+                cmd.extend([
+                    f"output.{prim_name}.position.0,0",
+                    f"output.{virt_name}.position.{prim_w},0",
+                ])
+            elif mode == "left":
+                cmd.extend([
+                    f"output.{virt_name}.position.0,0",
+                    f"output.{prim_name}.position.{virt_w},0",
+                ])
+            elif mode == "above":
+                cmd.extend([
+                    f"output.{virt_name}.position.0,0",
+                    f"output.{prim_name}.position.0,{virt_h}",
+                ])
+            elif mode == "below":
+                cmd.extend([
+                    f"output.{prim_name}.position.0,0",
+                    f"output.{virt_name}.position.0,{prim_h}",
+                ])
+
+        self._append_log(f">>> Applying layout ({mode}): {' '.join(cmd)}")
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode != 0 and mode == "mirror":
+            fallback = [
+                "kscreen-doctor",
+                f"output.{prim_name}.position.0,0",
+                f"output.{virt_name}.position.0,0",
+            ]
+            self._append_log(f">>> Mirror flag fallback: {' '.join(fallback)}")
+            subprocess.run(fallback, capture_output=True, text=True, check=False)
+        elif res.returncode != 0 and res.stderr.strip():
+            self._append_log(f">>> kscreen-doctor note: {res.stderr.strip()}")
+
+    def _restore_primary_origin(self) -> None:
+        """Reset primary screen back to 0,0 after stopping a left/above virtual screen."""
+        outputs = get_kscreen_outputs()
+        if len(outputs) == 1:
+            name = outputs[0].get("name")
+            pos = outputs[0].get("pos") or {}
+            if name and (pos.get("x", 0) != 0 or pos.get("y", 0) != 0):
+                subprocess.run(
+                    ["kscreen-doctor", f"output.{name}.position.0,0"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+    def set_server_backend(self, backend: str) -> None:
+        """Switch between Mouse & Keyboard Control (krfb) and 2nd Display Only."""
+        if self.config["server_backend"] != backend:
+            self.config["server_backend"] = backend
+            save_config(self.config)
+            self._sync_ui()
+            if self.is_active():
+                self.stop_service(for_restart=True)
+
+    def set_layout_mode(self, mode: str) -> None:
+        """Switch layout mode from the tray menu and apply immediately if running."""
+        if self.config["layout_mode"] != mode:
+            self.config["layout_mode"] = mode
+            save_config(self.config)
+            self._sync_ui()
+        if self.is_active() and self._active_backend == "virtual_monitor":
+            self.apply_virtual_layout()
+
+    def _on_process_finished(
+        self, exit_code: int, _exit_status: QtCore.QProcess.ExitStatus
+    ) -> None:
+        self._layout_timer.stop()
+        self._startup_poll_timer.stop()
+        exe = "krfb" if self._active_backend == "remote_control" else "krfb-virtualmonitor"
+        self._append_log(f">>> {exe} exited (code {exit_code})")
+        was_virtual = self._active_backend == "virtual_monitor"
+        self.virtual_output_name = None
+        self._active_backend = None
+        was_manual = self._manual_stop
+        restart = self._pending_restart
+        self._manual_stop = False
+        self._pending_restart = False
+
+        if was_virtual:
+            QtCore.QTimer.singleShot(250, self._restore_primary_origin)
+
+        if restart:
+            self.state = "stopped"
+            self._sync_ui()
+            QtCore.QTimer.singleShot(300, self.start_service)
+            return
+
+        if was_manual:
+            self.state = "stopped"
+            self.tray.showMessage(
+                "VNC Server Stopped",
+                "VNC screen sharing server is now off.",
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+        elif self.state != "error":
+            self.state = "error" if exit_code != 0 else "stopped"
+        self._sync_ui()
+
+    def _on_process_error(self, error: QtCore.QProcess.ProcessError) -> None:
+        self._layout_timer.stop()
+        self._startup_poll_timer.stop()
+        self._active_backend = None
+        self._append_log(f">>> Process error: {error}")
+        self.state = "error"
+        self._sync_ui()
+
+    def open_settings(self) -> None:
+        """Open the GUI password & display settings dialog."""
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
+
+        was_running = self.is_active()
+        dialog = SettingsDialog(self.config, was_running)
+        self._settings_dialog = dialog
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            new_cfg = dialog.result_config()
+            changed = new_cfg != self.config
+            only_layout_changed = (
+                changed
+                and self._active_backend == "virtual_monitor"
+                and all(
+                    new_cfg[k] == self.config[k]
+                    for k in new_cfg
+                    if k not in ("layout_mode", "auto_start_service")
+                )
+            )
+            self.config = new_cfg
+            save_config(self.config)
+            self._sync_ui()
+            if changed and was_running:
+                if only_layout_changed:
+                    self.apply_virtual_layout()
+                else:
+                    self.stop_service(for_restart=True)
+            elif changed:
+                if self.config["server_backend"] == "remote_control":
+                    sync_krfb_config(self.config)
+                self.tray.showMessage(
+                    "VNC Settings Saved",
+                    f"{backend_label(self.config['server_backend'])} • Port {self.config['port']}",
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                    2500,
+                )
+        self._settings_dialog = None
+
+    def open_connection_info(self) -> None:
+        """Open or focus the iPhone connection guide & copy helper window."""
+        if self._info_dialog is None:
+            self._info_dialog = ConnectionInfoDialog(self)
+        self._info_dialog.refresh()
+        self._info_dialog.show()
+        self._info_dialog.raise_()
+        self._info_dialog.activateWindow()
+
+    def open_logs(self) -> None:
+        """Open or focus the status & live log viewer window."""
+        if self._log_dialog is None:
+            self._log_dialog = LogViewerDialog(self)
+        self._log_dialog.refresh()
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def launch_local_viewer(self, _retry: bool = False) -> None:
+        """Launch local VNC viewer on Kali to preview the virtual 2nd screen."""
+        viewer = (
+            shutil.which("xtigervncviewer")
+            or shutil.which("vncviewer")
+            or shutil.which("xtightvncviewer")
+        )
+        if not viewer:
+            QtWidgets.QMessageBox.information(
+                None,
+                "No Local VNC Viewer Found",
+                "Install tigervnc-viewer (via installer.py) to preview locally.",
+            )
+            return
+        if not self.is_active():
+            if _retry:
+                return
+            self.start_service()
+            if self.is_active():
+                QtCore.QTimer.singleShot(1400, lambda: self.launch_local_viewer(_retry=True))
+            return
+        subprocess.Popen(
+            [viewer, f"127.0.0.1::{self.config['port']}"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def quit_app(self) -> None:
+        """Stop VNC server cleanly (if running) and exit the tray application."""
+        self._layout_timer.stop()
+        self._startup_poll_timer.stop()
+        if self.is_active():
+            self._manual_stop = True
+            self.process.terminate()
+            self.process.waitForFinished(1800)
+            if self.is_active():
+                self.process.kill()
+        self.tray.hide()
+        self.app.quit()
+
+
+def send_ipc_if_already_running(command: str) -> bool:
+    """Return True if an active tray instance accepted the IPC command."""
+    sock = QtNetwork.QLocalSocket()
+    sock.connectToServer(IPC_SERVER_NAME)
+    if not sock.waitForConnected(250):
+        return False
+    sock.write(command.encode("utf-8"))
+    sock.flush()
+    sock.waitForBytesWritten(250)
+    sock.disconnectFromServer()
+    return True
+
+
+def main() -> int:
+    if "--sync-config" in sys.argv[1:]:
+        cfg = load_config()
+        save_config(cfg)
+        if not sync_krfb_config(cfg):
+            print("Warning: could not update ~/.config/krfbrc (kwriteconfig not found).", file=sys.stderr)
+            return 1
+        return 0
+
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("vnc-tray")
+    app.setApplicationDisplayName("VNC 2nd Display")
+    app.setDesktopFileName("vnc-tray")
+    app.setQuitOnLastWindowClosed(False)
+
+    if "--toggle" in sys.argv[1:]:
+        if send_ipc_if_already_running("TOGGLE"):
+            return 0
+    elif send_ipc_if_already_running("SHOW_SETTINGS"):
+        return 0
+
+    if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+        QtWidgets.QMessageBox.critical(
+            None,
+            "System Tray Unavailable",
+            "No system tray was detected in this desktop session.",
+        )
+        return 1
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    controller = VncTrayApp(app)
+    app.aboutToQuit.connect(
+        lambda: controller.process.terminate() if controller.is_active() else None
+    )
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

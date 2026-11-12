@@ -5,6 +5,7 @@ Unified installer for desktop utilities:
   - customize-dock    (KDE Plasma 6 bottom dock & top bar customizer)
   - ram-cleaner       (Linux memory & idle-process cleaner CLI)
   - uxplay-tray       (UxPlay AirPlay installer, Avahi DNS-SD fix & top-bar toggle)
+  - vnc-tray          (VNC 2nd Display for iPhone, krfb/viewer setup & top-bar toggle)
 """
 
 import argparse
@@ -12,9 +13,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -67,6 +70,26 @@ APPS = {
         ],
         "enable_avahi": True,
         "pin_tray_id": "UxPlay AirPlay",
+        "start_tray": True,
+    },
+    "vnc-tray": {
+        "description": "VNC 2nd Display & iPhone Control Server Top-Bar Toggle + GUI Configurator (Qt6)",
+        "binary_rel": os.path.join("vnc-tray", "vnc-tray"),
+        "desktop_rel": os.path.join("vnc-tray", "vnc-tray.desktop"),
+        "icon_rel": os.path.join("vnc-tray", "vnc-tray.svg"),
+        "autostart": True,
+        "python_deps": [("PyQt6", "python3-pyqt6", "PyQt6")],
+        "system_deps": [
+            "krfb",
+            "tigervnc-viewer",
+            "avahi-daemon",
+            "avahi-utils",
+            "libkf6config-bin",
+            "libkscreen-bin",
+        ],
+        "enable_avahi": True,
+        "sync_config_flag": "--sync-config",
+        "pin_tray_id": "VNC 2nd Display",
         "start_tray": True,
     },
 }
@@ -568,26 +591,82 @@ def pin_plasma_tray_item(item_id, dry_run=False):
         print(f"    [✓] Pinned '{item_id}' in KDE Plasma top bar System Tray.")
 
 
+def _find_running_app_pids(app_name):
+    """Return PIDs running app_name via /proc/<pid>/cmdline (handles python3 shebangs safely)."""
+    pids = []
+    self_pid = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == self_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\x00") if part]
+        if not args:
+            continue
+        first_base = os.path.basename(args[0])
+        is_python = first_base.startswith("python")
+        if first_base == app_name or (is_python and len(args) > 1 and os.path.basename(args[1]) == app_name):
+            pids.append(pid)
+    return pids
+
+
 def stop_tray_service(app_name, dry_run=False):
-    """Stop any running user-session instance of the tray utility."""
+    """Stop any running systemd-run, XDG autostart, or standalone instance of the tray utility."""
     if dry_run:
         print(f"    [dry-run] Would stop running {app_name} tray instance")
         return
 
     if shutil.which("systemctl"):
-        subprocess.run(
-            ["systemctl", "--user", "stop", f"{app_name}.service"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    if shutil.which("pkill"):
-        subprocess.run(
-            ["pkill", "-x", app_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        escaped = app_name.replace("-", r"\x2d")
+        for unit in (f"{app_name}.service", f"app-{escaped}@autostart.service"):
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    remaining = _find_running_app_pids(app_name)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    if remaining:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and _find_running_app_pids(app_name):
+            time.sleep(0.1)
+        for pid in _find_running_app_pids(app_name):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def sync_app_config(app_name, bin_path, flag, dry_run=False):
+    """Pre-sync application and backend config (e.g. krfbrc password keys) during install."""
+    if dry_run:
+        print(f"    [dry-run] Would sync {app_name} configuration ({bin_path} {flag})")
+        return
+
+    res = subprocess.run([bin_path, flag], capture_output=True, text=True, check=False)
+    if res.returncode == 0:
+        print(f"    [✓] Synced {app_name} config & krfb password keys (unattendedPassword / desktopPassword).")
+    else:
+        detail = res.stderr.strip() or res.stdout.strip() or f"exit code {res.returncode}"
+        print(f"    [!] Config sync warning for {app_name}: {detail}")
 
 
 def start_tray_service(app_name, bin_path, dry_run=False):
@@ -694,6 +773,12 @@ def install_all(args):
         if meta.get("enable_avahi"):
             ensure_avahi_dns_sd(dry_run=args.dry_run)
 
+        if meta.get("sync_config_flag"):
+            if meta.get("start_tray"):
+                # Stop active tray/krfb before syncing so krfb's shutdown saveConfig() cannot overwrite krfbrc.
+                stop_tray_service(app_name, dry_run=args.dry_run)
+            sync_app_config(app_name, dest_bin, meta["sync_config_flag"], dry_run=args.dry_run)
+
         if meta.get("pin_tray_id"):
             pin_plasma_tray_item(meta["pin_tray_id"], dry_run=args.dry_run)
 
@@ -780,7 +865,7 @@ def uninstall_all(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Install lockscreen-config, customize-dock, ram-cleaner, and uxplay-tray."
+        description="Install lockscreen-config, customize-dock, ram-cleaner, uxplay-tray, and vnc-tray."
     )
     parser.add_argument(
         "--only",
