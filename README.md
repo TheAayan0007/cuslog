@@ -1,0 +1,30 @@
+# Desktop Utilities Bundle (`utils`)
+
+Exported utilities:
+- **`lockscreen-config`** (`lockscreen-config/`): KDE Plasma 6 Breeze lock screen, logout screen, and SDDM login customizer (`PyQt6`).
+- **`customize-dock`** (`customize-dock/`): KDE Plasma 6 bottom dock & top bar customizer (`PyQt6` GUI + CLI), the `Panel.qml` shell view override for independent top-bar styling, and the `CompactApplet.qml` override that lets you triple-click the bottom Application Launcher (Kali logo) to toggle the bottom dock between **Dodge Windows** and **Auto Hide**.
+- **`ram-cleaner`** (`ram-cleaner/`): Memory & idle-process cleaner CLI (`psutil`).
+- **`uxplay-tray`** (`uxplay-tray/`): Installs `uxplay`, `avahi-daemon`, and GStreamer plugins, auto-fixes the `No DNS-SD Server found` (`avahi-daemon`) error, and pins a top-bar AirPlay toggle button (left-click to start/stop mirroring, right-click to edit the AirPlay name via GUI or quit).
+
+## Install All Four
+```bash
+python3 installer.py
+```
+
+### Useful Options
+- Preview without modifying files:
+  ```bash
+  python3 installer.py --dry-run
+  ```
+- Also symlink into `/usr/local/bin` (useful for `sudo ram-cleaner`):
+  ```bash
+  python3 installer.py --global
+  ```
+- Install only specific apps:
+  ```bash
+  python3 installer.py --only customize-dock ram-cleaner
+  ```
+- Uninstall:
+  ```bash
+  python3 installer.py --uninstall
+  ```

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=UxPlay AirPlay
+GenericName=AirPlay Mirroring Toggle
+Comment=Start/stop UxPlay AirPlay mirroring from the top bar and edit device name
+Exec=uxplay-tray
+Icon=uxplay-tray
+Terminal=false
+Categories=AudioVideo;Network;Utility;
+Keywords=airplay;uxplay;mirror;iphone;ipad;cast;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

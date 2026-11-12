@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""System tray toggle and GUI controller for UxPlay AirPlay mirroring."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
+
+CONFIG_DIR = Path.home() / ".config" / "uxplay-tray"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+IPC_SERVER_NAME = f"uxplay-tray-{os.getuid()}"
+APP_ICON_PATH = Path.home() / ".local/share/icons/hicolor/scalable/apps/uxplay-tray.svg"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "name": "kaliaayan",
+    "hide_hostname": True,
+    "fullscreen": False,
+    "use_pin": False,
+    "pin_code": "",
+    "auto_start_service": False,
+}
+
+DARK_DIALOG_STYLE = """
+QDialog {
+    background-color: #111827;
+    color: #f3f4f6;
+}
+QLabel {
+    color: #e5e7eb;
+}
+QLineEdit, QPlainTextEdit {
+    background-color: #1f2937;
+    color: #f9fafb;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 6px 10px;
+    selection-background-color: #0284c7;
+}
+QLineEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #38bdf8;
+}
+QCheckBox {
+    color: #e5e7eb;
+    spacing: 8px;
+}
+QPushButton {
+    background-color: #1f2937;
+    color: #f3f4f6;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #374151;
+}
+QPushButton#primaryBtn {
+    background-color: #0284c7;
+    border-color: #0ea5e9;
+    color: #ffffff;
+}
+QPushButton#primaryBtn:hover {
+    background-color: #0ea5e9;
+}
+QPushButton#dangerBtn {
+    background-color: #7f1d1d;
+    border-color: #991b1b;
+    color: #fecaca;
+}
+QPushButton#dangerBtn:hover {
+    background-color: #991b1b;
+}
+"""
+
+
+def load_config() -> dict[str, Any]:
+    """Load persistent tray/UxPlay settings, falling back to defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+    name = str(cfg.get("name", "")).strip()
+    cfg["name"] = name or DEFAULT_CONFIG["name"]
+    cfg["hide_hostname"] = bool(cfg.get("hide_hostname", True))
+    cfg["fullscreen"] = bool(cfg.get("fullscreen", False))
+    cfg["use_pin"] = bool(cfg.get("use_pin", False))
+    cfg["pin_code"] = re.sub(r"\D", "", str(cfg.get("pin_code", "")))[:4]
+    cfg["auto_start_service"] = bool(cfg.get("auto_start_service", False))
+    return cfg
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    """Persist configuration atomically to user config directory."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_file = CONFIG_FILE.with_suffix(".tmp")
+    tmp_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    tmp_file.replace(CONFIG_FILE)
+
+
+def visible_airplay_name(cfg: dict[str, Any]) -> str:
+    """Return the AirPlay display name as seen from an iPhone."""
+    base = cfg["name"]
+    if cfg.get("hide_hostname", True):
+        return base
+    return f"{base}@{socket.gethostname()}"
+
+
+def build_tray_icon(state: str) -> QtGui.QIcon:
+    """Render a crisp AirPlay icon for the top bar reflecting service state."""
+    icon = QtGui.QIcon()
+    for size in (22, 32, 48, 64):
+        pixmap = QtGui.QPixmap(size, size)
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+        scale = size / 64.0
+        painter.scale(scale, scale)
+
+        if state == "running":
+            screen_color = QtGui.QColor("#38bdf8")
+            triangle_color = QtGui.QColor("#22c55e")
+            badge_color = QtGui.QColor("#22c55e")
+        elif state == "starting":
+            screen_color = QtGui.QColor("#fbbf24")
+            triangle_color = QtGui.QColor("#fbbf24")
+            badge_color = QtGui.QColor("#f59e0b")
+        elif state == "error":
+            screen_color = QtGui.QColor("#f87171")
+            triangle_color = QtGui.QColor("#ef4444")
+            badge_color = QtGui.QColor("#ef4444")
+        else:
+            screen_color = QtGui.QColor("#cbd5e1")
+            triangle_color = QtGui.QColor("#94a3b8")
+            badge_color = None
+
+        # Draw outer TV/display frame with bottom notch for the AirPlay triangle
+        pen = QtGui.QPen(screen_color, 5.2)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+        frame_path = QtGui.QPainterPath()
+        frame_path.moveTo(21, 44)
+        frame_path.lineTo(13, 44)
+        frame_path.quadTo(9, 44, 9, 40)
+        frame_path.lineTo(9, 16)
+        frame_path.quadTo(9, 12, 13, 12)
+        frame_path.lineTo(51, 12)
+        frame_path.quadTo(55, 12, 55, 16)
+        frame_path.lineTo(55, 40)
+        frame_path.quadTo(55, 44, 51, 44)
+        frame_path.lineTo(43, 44)
+        painter.drawPath(frame_path)
+
+        # Draw bottom AirPlay triangle
+        painter.setPen(QtGui.QPen(QtGui.QColor("#0f172a"), 1.6))
+        painter.setBrush(triangle_color)
+        tri = QtGui.QPolygonF(
+            [
+                QtCore.QPointF(32.0, 31.0),
+                QtCore.QPointF(45.5, 51.5),
+                QtCore.QPointF(18.5, 51.5),
+            ]
+        )
+        painter.drawPolygon(tri)
+
+        # Draw small status indicator badge in bottom-right when active/starting/error
+        if badge_color is not None:
+            painter.setPen(QtGui.QPen(QtGui.QColor("#0f172a"), 2.5))
+            painter.setBrush(badge_color)
+            painter.drawEllipse(QtCore.QRectF(43.0, 41.0, 15.0, 15.0))
+
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
+def find_external_uxplay_pids() -> list[int]:
+    """Return PIDs of running uxplay processes not owned by this tray instance."""
+    try:
+        out = subprocess.check_output(["pgrep", "-x", "uxplay"], text=True).strip()
+    except subprocess.CalledProcessError:
+        return []
+    return [int(line) for line in out.splitlines() if line.strip().isdigit()]
+
+
+def is_avahi_active() -> bool:
+    """Return True if systemd avahi-daemon service is active."""
+    res = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "avahi-daemon"],
+        check=False,
+    )
+    return res.returncode == 0
+
+
+def get_primary_ip() -> str:
+    """Best-effort lookup of non-loopback local IPv4 address for display."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("1.1.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "localhost"
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    """GUI dialog for editing the AirPlay name and mirroring options."""
+
+    def __init__(self, cfg: dict[str, Any], is_running: bool, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AirPlay Settings — UxPlay")
+        self.setWindowIcon(build_tray_icon("running" if is_running else "stopped"))
+        self.setMinimumWidth(410)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        title = QtWidgets.QLabel("Edit AirPlay Receiver Name")
+        title.setStyleSheet("font-size: 15px; font-weight: 600; color: #f9fafb;")
+        layout.addWidget(title)
+
+        name_label = QtWidgets.QLabel("Device name shown on iPhone / iPad:")
+        layout.addWidget(name_label)
+
+        self.name_edit = QtWidgets.QLineEdit(cfg["name"])
+        self.name_edit.setPlaceholderText("e.g. kaliaayan2")
+        self.name_edit.selectAll()
+        layout.addWidget(self.name_edit)
+
+        self.preview_label = QtWidgets.QLabel()
+        self.preview_label.setStyleSheet("color: #38bdf8; font-size: 12px;")
+        layout.addWidget(self.preview_label)
+
+        self.hide_host_cb = QtWidgets.QCheckBox(
+            f"Clean name (do not append @{socket.gethostname()})"
+        )
+        self.hide_host_cb.setChecked(cfg.get("hide_hostname", True))
+        layout.addWidget(self.hide_host_cb)
+
+        self.fullscreen_cb = QtWidgets.QCheckBox("Start mirroring window in fullscreen (-fs)")
+        self.fullscreen_cb.setChecked(cfg.get("fullscreen", False))
+        layout.addWidget(self.fullscreen_cb)
+
+        pin_row = QtWidgets.QHBoxLayout()
+        self.pin_cb = QtWidgets.QCheckBox("Require PIN code (-pin):")
+        self.pin_cb.setChecked(cfg.get("use_pin", False))
+        self.pin_edit = QtWidgets.QLineEdit(cfg.get("pin_code", ""))
+        self.pin_edit.setPlaceholderText("4 digits or blank=random")
+        self.pin_edit.setMaxLength(4)
+        self.pin_edit.setEnabled(self.pin_cb.isChecked())
+        pin_row.addWidget(self.pin_cb)
+        pin_row.addWidget(self.pin_edit)
+        layout.addLayout(pin_row)
+
+        self.autostart_service_cb = QtWidgets.QCheckBox(
+            "Auto-start AirPlay server when tray icon opens at login"
+        )
+        self.autostart_service_cb.setChecked(cfg.get("auto_start_service", False))
+        layout.addWidget(self.autostart_service_cb)
+
+        self.name_edit.textChanged.connect(self._update_preview)
+        self.hide_host_cb.toggled.connect(self._update_preview)
+        self.pin_cb.toggled.connect(self.pin_edit.setEnabled)
+        self._update_preview()
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        save_label = "Save & Restart AirPlay" if is_running else "Save"
+        save_btn = QtWidgets.QPushButton(save_label)
+        save_btn.setObjectName("primaryBtn")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_accept)
+        btn_row.addWidget(save_btn)
+
+        layout.addLayout(btn_row)
+
+    def _update_preview(self) -> None:
+        raw = self.name_edit.text().strip() or DEFAULT_CONFIG["name"]
+        shown = raw if self.hide_host_cb.isChecked() else f"{raw}@{socket.gethostname()}"
+        self.preview_label.setText(f"Visible on iPhone as: {shown}")
+
+    def _on_accept(self) -> None:
+        name = self.name_edit.text().strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Name", "AirPlay name cannot be empty."
+            )
+            self.name_edit.setFocus()
+            return
+
+        pin_raw = self.pin_edit.text().strip()
+        if self.pin_cb.isChecked() and pin_raw and not re.fullmatch(r"\d{4}", pin_raw):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid PIN",
+                "PIN must be exactly 4 digits, or leave blank for a random PIN.",
+            )
+            self.pin_edit.setFocus()
+            return
+        self.accept()
+
+    def result_config(self) -> dict[str, Any]:
+        """Return validated settings dictionary from the form."""
+        return {
+            "name": self.name_edit.text().strip(),
+            "hide_hostname": self.hide_host_cb.isChecked(),
+            "fullscreen": self.fullscreen_cb.isChecked(),
+            "use_pin": self.pin_cb.isChecked(),
+            "pin_code": self.pin_edit.text().strip(),
+            "auto_start_service": self.autostart_service_cb.isChecked(),
+        }
+
+
+class LogViewerDialog(QtWidgets.QDialog):
+    """Non-blocking status & live log viewer window."""
+
+    def __init__(self, controller: "UxPlayTrayApp", parent=None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("UxPlay Status & Logs")
+        self.setWindowIcon(build_tray_icon(controller.state))
+        self.resize(620, 380)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setStyleSheet("font-weight: 600; font-size: 13px;")
+        layout.addWidget(self.status_label)
+
+        self.log_box = QtWidgets.QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFont(QtGui.QFont("monospace", 9))
+        layout.addWidget(self.log_box)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.toggle_btn = QtWidgets.QPushButton()
+        self.toggle_btn.setObjectName("primaryBtn")
+        self.toggle_btn.clicked.connect(controller.toggle_service)
+        btn_row.addWidget(self.toggle_btn)
+
+        edit_btn = QtWidgets.QPushButton("Edit Name...")
+        edit_btn.clicked.connect(controller.open_settings)
+        btn_row.addWidget(edit_btn)
+
+        clear_btn = QtWidgets.QPushButton("Clear Logs")
+        clear_btn.clicked.connect(self._clear_logs)
+        btn_row.addWidget(clear_btn)
+
+        btn_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close Window")
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self.refresh()
+
+    def _clear_logs(self) -> None:
+        self.controller.log_lines.clear()
+        self.log_box.clear()
+
+    def append_line(self, line: str) -> None:
+        self.log_box.appendPlainText(line)
+
+    def refresh(self) -> None:
+        cfg = self.controller.config
+        avahi_ok = "Active" if is_avahi_active() else "Inactive"
+        shown = visible_airplay_name(cfg)
+        ip = get_primary_ip()
+        state_text = self.controller.state.capitalize()
+        self.status_label.setText(
+            f"State: {state_text}   |   AirPlay Name: {shown}   |   "
+            f"Avahi: {avahi_ok}   |   IP: {ip}"
+        )
+        self.toggle_btn.setText(
+            "Stop AirPlay" if self.controller.is_active() else "Start AirPlay"
+        )
+        self.log_box.setPlainText("\n".join(self.controller.log_lines))
+        scrollbar = self.log_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+
+class UxPlayTrayApp(QtCore.QObject):
+    """Main controller managing the top-bar tray icon and UxPlay subprocess."""
+
+    def __init__(self, app: QtWidgets.QApplication) -> None:
+        super().__init__()
+        self.app = app
+        self.config = load_config()
+        self.state = "stopped"
+        self.log_lines: list[str] = []
+        self._pending_restart = False
+        self._manual_stop = False
+        self._log_dialog: LogViewerDialog | None = None
+        self._settings_dialog: SettingsDialog | None = None
+
+        self.process = QtCore.QProcess(self)
+        self.process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._on_process_output)
+        self.process.finished.connect(self._on_process_finished)
+        self.process.errorOccurred.connect(self._on_process_error)
+
+        self.tray = QtWidgets.QSystemTrayIcon(self)
+        self.tray.activated.connect(self._on_tray_activated)
+
+        self._build_menu()
+        self._sync_ui()
+        self.tray.show()
+
+        self._setup_ipc_server()
+
+        if self.config.get("auto_start_service", False):
+            QtCore.QTimer.singleShot(400, self.start_service)
+
+    def _setup_ipc_server(self) -> None:
+        QtNetwork.QLocalServer.removeServer(IPC_SERVER_NAME)
+        self.ipc_server = QtNetwork.QLocalServer(self)
+        self.ipc_server.listen(IPC_SERVER_NAME)
+        self.ipc_server.newConnection.connect(self._on_ipc_connection)
+
+    def _on_ipc_connection(self) -> None:
+        conn = self.ipc_server.nextPendingConnection()
+        if not conn:
+            return
+        conn.readyRead.connect(lambda: self._handle_ipc_message(conn))
+
+    def _handle_ipc_message(self, conn: QtNetwork.QLocalSocket) -> None:
+        msg = bytes(conn.readAll()).decode("utf-8", errors="ignore").strip()
+        conn.close()
+        if msg == "TOGGLE":
+            self.toggle_service()
+        else:
+            self.open_settings()
+
+    def _build_menu(self) -> None:
+        self.menu = QtWidgets.QMenu()
+
+        self.status_action = self.menu.addAction("")
+        self.status_action.setEnabled(False)
+        self.menu.addSeparator()
+
+        self.toggle_action = self.menu.addAction("Start AirPlay")
+        self.toggle_action.triggered.connect(self.toggle_service)
+
+        self.edit_action = self.menu.addAction("Edit AirPlay Name...")
+        self.edit_action.triggered.connect(self.open_settings)
+
+        self.logs_action = self.menu.addAction("View Status / Logs...")
+        self.logs_action.triggered.connect(self.open_logs)
+
+        self.menu.addSeparator()
+
+        self.quit_action = self.menu.addAction("Close / Quit Tray")
+        self.quit_action.triggered.connect(self.quit_app)
+
+        self.tray.setContextMenu(self.menu)
+
+    def is_active(self) -> bool:
+        """Return True if UxPlay process is starting or running."""
+        return self.process.state() != QtCore.QProcess.ProcessState.NotRunning
+
+    def _sync_ui(self) -> None:
+        shown = visible_airplay_name(self.config)
+        self.tray.setIcon(build_tray_icon(self.state))
+
+        if self.state == "running":
+            self.status_action.setText(f"● Active: {shown}")
+            self.toggle_action.setText("Stop AirPlay")
+            self.tray.setToolTip(
+                f"AirPlay Mirroring: ON ({shown})\n"
+                "Left-click to stop • Right-click to edit name"
+            )
+        elif self.state == "starting":
+            self.status_action.setText(f"◐ Starting: {shown}...")
+            self.toggle_action.setText("Stop AirPlay")
+            self.tray.setToolTip(f"AirPlay Mirroring: Starting ({shown})...")
+        elif self.state == "error":
+            self.status_action.setText(f"! Error starting: {shown}")
+            self.toggle_action.setText("Start AirPlay")
+            self.tray.setToolTip(
+                f"AirPlay Mirroring: Error ({shown})\n"
+                "Left-click to retry • Right-click for logs"
+            )
+        else:
+            self.status_action.setText(f"○ Stopped — Name: {shown}")
+            self.toggle_action.setText("Start AirPlay")
+            self.tray.setToolTip(
+                f"AirPlay Mirroring: OFF ({shown})\n"
+                "Left-click to start • Right-click to edit name"
+            )
+
+        if self._log_dialog is not None and self._log_dialog.isVisible():
+            self._log_dialog.refresh()
+
+    def _append_log(self, line: str) -> None:
+        self.log_lines.append(line)
+        if len(self.log_lines) > 400:
+            self.log_lines = self.log_lines[-400:]
+        if self._log_dialog is not None and self._log_dialog.isVisible():
+            self._log_dialog.append_line(line)
+
+    def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QtWidgets.QSystemTrayIcon.ActivationReason.Trigger,
+            QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.toggle_service()
+        elif reason == QtWidgets.QSystemTrayIcon.ActivationReason.MiddleClick:
+            self.open_settings()
+
+    def toggle_service(self) -> None:
+        """Start UxPlay if stopped, or stop it if running."""
+        if self.is_active():
+            self.stop_service()
+        else:
+            self.start_service()
+
+    def _ensure_avahi_running(self) -> bool:
+        """Ensure avahi-daemon is active, offering Polkit start if inactive."""
+        if is_avahi_active():
+            return True
+        reply = QtWidgets.QMessageBox.question(
+            None,
+            "Avahi Service Inactive",
+            "Avahi (mDNS / DNS-SD) is required for AirPlay discovery and is not running.\n\n"
+            "Start avahi-daemon now?",
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return False
+        res = subprocess.run(
+            ["systemctl", "enable", "--now", "avahi-daemon"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Failed to Start Avahi",
+                res.stderr.strip() or "Could not start avahi-daemon.",
+            )
+            return False
+        return is_avahi_active()
+
+    def _handle_external_uxplay(self) -> bool:
+        """Detect pre-existing CLI uxplay instances and offer to replace them."""
+        pids = find_external_uxplay_pids()
+        if not pids:
+            return True
+        reply = QtWidgets.QMessageBox.question(
+            None,
+            "Existing UxPlay Process Found",
+            f"Another uxplay instance is already running (PID: {', '.join(map(str, pids))}).\n\n"
+            "Stop the existing instance so this toggle can manage AirPlay cleanly?",
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return False
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        QtCore.QThread.msleep(350)
+        return True
+
+    def start_service(self) -> None:
+        """Launch UxPlay with the configured AirPlay name and options."""
+        if self.is_active():
+            return
+        if not self._ensure_avahi_running():
+            return
+        if not self._handle_external_uxplay():
+            return
+
+        args = ["-n", self.config["name"]]
+        if self.config.get("hide_hostname", True):
+            args.append("-nh")
+        if self.config.get("fullscreen", False):
+            args.append("-fs")
+        if self.config.get("use_pin", False):
+            pin = self.config.get("pin_code", "")
+            args.append(f"-pin{pin}" if pin else "-pin")
+
+        self._manual_stop = False
+        self.state = "starting"
+        self._append_log(f">>> Starting: uxplay {' '.join(args)}")
+        self._sync_ui()
+        self.process.start("uxplay", args)
+
+    def stop_service(self, for_restart: bool = False) -> None:
+        """Gracefully terminate the managed UxPlay process."""
+        self._pending_restart = for_restart
+        if not self.is_active():
+            self.state = "stopped"
+            self._sync_ui()
+            if for_restart:
+                self._pending_restart = False
+                QtCore.QTimer.singleShot(250, self.start_service)
+            return
+
+        self._manual_stop = True
+        self._append_log(">>> Stopping uxplay...")
+        self.process.terminate()
+        QtCore.QTimer.singleShot(2500, self._force_kill_if_stuck)
+
+    def _force_kill_if_stuck(self) -> None:
+        if self._manual_stop and self.is_active():
+            self._append_log(">>> Force killing unresponsive uxplay process...")
+            self.process.kill()
+
+    def _on_process_output(self) -> None:
+        raw = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in raw.splitlines():
+            clean = line.rstrip()
+            if not clean:
+                continue
+            self._append_log(clean)
+
+            if "Initialized server socket(s)" in clean and self.state == "starting":
+                # Wait briefly to confirm DNS-SD registration didn't error immediately
+                QtCore.QTimer.singleShot(350, self._confirm_started)
+            elif "*** ERROR:" in clean:
+                self.state = "error"
+                self._sync_ui()
+                self.tray.showMessage(
+                    "UxPlay AirPlay Error",
+                    clean.replace("*** ERROR:", "").strip(),
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Critical,
+                    5000,
+                )
+
+    def _confirm_started(self) -> None:
+        if self.is_active() and self.state == "starting":
+            self.state = "running"
+            self._sync_ui()
+            shown = visible_airplay_name(self.config)
+            self.tray.showMessage(
+                "AirPlay Ready",
+                f'Mirror your iPhone to "{shown}"',
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                3500,
+            )
+
+    def _on_process_finished(self, exit_code: int, _exit_status: QtCore.QProcess.ExitStatus) -> None:
+        self._append_log(f">>> uxplay exited (code {exit_code})")
+        was_manual = self._manual_stop
+        restart = self._pending_restart
+        self._manual_stop = False
+        self._pending_restart = False
+
+        if restart:
+            self.state = "stopped"
+            self._sync_ui()
+            QtCore.QTimer.singleShot(300, self.start_service)
+            return
+
+        if was_manual:
+            self.state = "stopped"
+            self.tray.showMessage(
+                "AirPlay Stopped",
+                "UxPlay mirroring server is now off.",
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+        elif self.state != "error":
+            self.state = "error" if exit_code != 0 else "stopped"
+        self._sync_ui()
+
+    def _on_process_error(self, error: QtCore.QProcess.ProcessError) -> None:
+        self._append_log(f">>> Process error: {error}")
+        self.state = "error"
+        self._sync_ui()
+
+    def open_settings(self) -> None:
+        """Open the GUI name & settings dialog."""
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
+
+        was_running = self.is_active()
+        dialog = SettingsDialog(self.config, was_running)
+        self._settings_dialog = dialog
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            new_cfg = dialog.result_config()
+            changed = new_cfg != self.config
+            self.config = new_cfg
+            save_config(self.config)
+            self._sync_ui()
+            if changed and was_running:
+                self.stop_service(for_restart=True)
+            elif changed:
+                self.tray.showMessage(
+                    "AirPlay Name Updated",
+                    f'Saved name: "{visible_airplay_name(self.config)}"',
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                    2500,
+                )
+        self._settings_dialog = None
+
+    def open_logs(self) -> None:
+        """Open or focus the status & live logs window."""
+        if self._log_dialog is None:
+            self._log_dialog = LogViewerDialog(self)
+        self._log_dialog.refresh()
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def quit_app(self) -> None:
+        """Stop UxPlay cleanly (if running) and exit the tray app."""
+        if self.is_active():
+            self._manual_stop = True
+            self.process.terminate()
+            self.process.waitForFinished(1800)
+            if self.is_active():
+                self.process.kill()
+        self.tray.hide()
+        self.app.quit()
+
+
+def send_ipc_if_already_running(command: str) -> bool:
+    """Return True if an active tray instance accepted the command."""
+    sock = QtNetwork.QLocalSocket()
+    sock.connectToServer(IPC_SERVER_NAME)
+    if not sock.waitForConnected(250):
+        return False
+    sock.write(command.encode("utf-8"))
+    sock.flush()
+    sock.waitForBytesWritten(250)
+    sock.disconnectFromServer()
+    return True
+
+
+def main() -> int:
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("uxplay-tray")
+    app.setApplicationDisplayName("UxPlay AirPlay")
+    app.setDesktopFileName("uxplay-tray")
+    app.setQuitOnLastWindowClosed(False)
+
+    if "--toggle" in sys.argv[1:]:
+        if send_ipc_if_already_running("TOGGLE"):
+            return 0
+    elif send_ipc_if_already_running("SHOW_SETTINGS"):
+        return 0
+
+    if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+        QtWidgets.QMessageBox.critical(
+            None,
+            "System Tray Unavailable",
+            "No system tray was detected in this desktop session.",
+        )
+        return 1
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    controller = UxPlayTrayApp(app)
+    app.aboutToQuit.connect(
+        lambda: controller.process.terminate() if controller.is_active() else None
+    )
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
